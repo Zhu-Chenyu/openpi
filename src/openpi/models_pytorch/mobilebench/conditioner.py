@@ -65,13 +65,14 @@ class StepInputs:
     dt: Tensor  # [B] seconds since the previous policy update
     gripper_desc: Tensor  # [B, gripper_dim]  static gripper / TCP description
     base_desc: Tensor  # [B, base_desc_dim] body-motion interface description
-    eef_pos: Tensor  # [B, 3]  current TCP pose in the body frame B_t
-    eef_rot: Tensor  # [B, 3, 3]
+    eef_pos: Tensor  # [B, E, 3]  current TCP pose of every end effector in the body frame B_t
+    eef_rot: Tensor  # [B, E, 3, 3]
     lib_pos: Tensor  # [B, N_W, 3]  reachable-pose library (fixed per robot)
     lib_rot: Tensor  # [B, N_W, 3, 3]
     lib_cost: Tensor  # [B, N_W]   c_i (see workspace.joint_space_cost)
     lib_margin: Tensor  # [B, N_W]  mu_i
     ws_mask: Tensor  # [B, N_W]  True = valid library sample (all False for arm-less robots)
+    lib_ee: Tensor  # [B, N_W] long: end effector each library sample belongs to
     ee_mask: Tensor  # [B, E]    True = end effector exists
     new_episode: Tensor  # [B] reset this slot's memory before updating
 
@@ -156,7 +157,9 @@ class MobileBenchConditioner(nn.Module):
         x_tok = self._tokens(self.exec_enc, inp.exec_increment, inp.exec_mask, cfg.exec_tokens)
         g_tok = self.gripper_enc(inp.gripper_desc)[:, None]
         base_tok = self.base_enc(inp.base_desc)[:, None]
-        ws_feats = workspace_features(inp.lib_pos, inp.lib_rot, inp.eef_pos, inp.eef_rot, inp.lib_cost, inp.lib_margin)
+        ws_feats = workspace_features(
+            inp.lib_pos, inp.lib_rot, inp.eef_pos, inp.eef_rot, inp.lib_ee, inp.lib_cost, inp.lib_margin
+        )
         w_tok = self.workspace_enc(ws_feats)
 
         # Current-observation affordance: H_t and state only.
@@ -186,7 +189,7 @@ class MobileBenchConditioner(nn.Module):
         # Goal-conditioned capability.
         capability = self.goal_ws(
             goal.pos, goal.rot6d, goal.rot, goal_gate, g_tok, ctx, ctx_mask,
-            w_tok, inp.ws_mask, inp.lib_pos, inp.lib_rot, inp.lib_cost, inp.lib_margin,
+            w_tok, inp.ws_mask, inp.lib_ee, inp.lib_pos, inp.lib_rot, inp.lib_cost, inp.lib_margin,
         )  # fmt: skip
 
         # Online mode: latest features + predictions, never the true phase.

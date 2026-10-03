@@ -94,7 +94,11 @@ class RelationalCrossAttention(nn.Module):
         self.out = nn.Linear(d, d)
 
     def forward(self, q: Tensor, kv: Tensor, rel: Tensor, kv_mask: Tensor | None = None) -> Tensor:
-        """q [B, Nq, d], kv [B, N, d], rel [B, Nq, N, rel_dim], kv_mask [B, N] (True=valid)."""
+        """q [B, Nq, d], kv [B, N, d], rel [B, Nq, N, rel_dim], kv_mask [B, N] or [B, Nq, N] (True=valid).
+
+        A query row with no valid key gets uniform weights instead of NaN (finite fill
+        value); such rows belong to absent end effectors and are NULL-gated downstream.
+        """
         b, nq, d = q.shape
         n = kv.shape[1]
         qh = self.q(q).view(b, nq, self.heads, self.dh).transpose(1, 2)  # [B, H, Nq, dh]
@@ -102,7 +106,8 @@ class RelationalCrossAttention(nn.Module):
         logits = qh @ kh.transpose(-1, -2) / math.sqrt(self.dh)  # [B, H, Nq, N]
         logits = logits + self.rel_bias(rel).permute(0, 3, 1, 2)
         if kv_mask is not None:
-            logits = logits.masked_fill(~kv_mask[:, None, None, :], torch.finfo(logits.dtype).min)
+            m = kv_mask[:, None, None, :] if kv_mask.dim() == 2 else kv_mask[:, None]
+            logits = logits.masked_fill(~m, torch.finfo(logits.dtype).min)
         attn = logits.softmax(dim=-1)
         # Values depend on the (query, key) pair through delta, so they are per-query.
         vals = self.v(torch.cat([kv[:, None].expand(b, nq, n, d), self.rel_value(rel)], dim=-1))

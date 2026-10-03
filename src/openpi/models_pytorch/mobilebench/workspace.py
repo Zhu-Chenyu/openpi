@@ -45,15 +45,28 @@ def joint_space_cost(
 
 
 def workspace_features(
-    lib_pos: Tensor, lib_rot: Tensor, eef_pos: Tensor, eef_rot: Tensor, cost: Tensor, margin: Tensor
+    lib_pos: Tensor,
+    lib_rot: Tensor,
+    eef_pos: Tensor,
+    eef_rot: Tensor,
+    lib_ee: Tensor,
+    cost: Tensor,
+    margin: Tensor,
 ) -> Tensor:
-    """lib_pos [B,N,3], lib_rot [B,N,3,3], eef_pos [B,3], eef_rot [B,3,3], cost/margin [B,N] -> [B,N,20]."""
-    rel_rot = eef_rot.transpose(-1, -2)[:, None] @ lib_rot
+    """lib_pos [B,N,3], lib_rot [B,N,3,3], eef_pos [B,E,3], eef_rot [B,E,3,3], lib_ee [B,N], cost/margin [B,N] -> [B,N,20].
+
+    Every sample is related to the CURRENT pose of the end effector it belongs to (lib_ee),
+    so a multi-arm library is one token set without mixing the arms' relations.
+    """
+    idx = lib_ee.clamp_min(0)
+    p_e = eef_pos.gather(1, idx[..., None].expand(-1, -1, 3))  # [B, N, 3]
+    r_e = eef_rot.gather(1, idx[..., None, None].expand(-1, -1, 3, 3))  # [B, N, 3, 3]
+    rel_rot = r_e.transpose(-1, -2) @ lib_rot
     return torch.cat(
         [
             lib_pos,
             matrix_to_rot6d(lib_rot),
-            lib_pos - eef_pos[:, None],
+            lib_pos - p_e,
             matrix_to_rot6d(rel_rot),
             cost[..., None],
             margin[..., None],
@@ -115,6 +128,7 @@ class GoalWorkspaceDecoder(nn.Module):
         context_mask: Tensor | None,
         ws_tokens: Tensor,
         ws_mask: Tensor | None,
+        lib_ee: Tensor,
         lib_pos: Tensor,
         lib_rot: Tensor,
         cost: Tensor,
@@ -125,6 +139,7 @@ class GoalWorkspaceDecoder(nn.Module):
         goal_*:   [B, E, ...] predicted goal per end effector; goal_gate [B, E] validity in [0, 1]
         context:  source-tagged [H ; M^F ; M^S ; s_t] (e_g is appended here)
         ws_*:     W_t [B, N, d], its padding mask, and the raw library poses/cost/margin
+        lib_ee:   [B, N] end effector of each sample; goal query e only reads its own arm's samples
         Where the goal is invalid the dedicated C_NULL is used instead of a geometric
         query against a placeholder pose (sec. 8.4).
         """
@@ -144,8 +159,10 @@ class GoalWorkspaceDecoder(nn.Module):
             ],
             dim=-1,
         )
+        own = lib_ee[:, None, :] == torch.arange(e, device=lib_ee.device)[None, :, None]  # [B, E, N]
+        pair_mask = own if ws_mask is None else own & ws_mask[:, None, :]
         for layer in self.layers:
-            q = layer(q, ctx, ctx_pad, ws_tokens, ws_mask, rel)
+            q = layer(q, ctx, ctx_pad, ws_tokens, pair_mask, rel)
         c = self.out_norm(q)
         g = goal_gate[..., None]
         return g * c + (1.0 - g) * self.c_null

@@ -23,7 +23,7 @@ CFG = MobileBenchConfig(
     exec_dim=6,
     gripper_dim=4,
     base_desc_dim=3,
-    num_end_effectors=1,
+    num_end_effectors=2,
     trace_lags=3,
     phase_text_dim=16,
     slow_write_every=4,
@@ -58,13 +58,14 @@ def make_inputs(b=2, *, armless=False, new_episode=None, seed=0):
         dt=torch.full((b,), 0.5),
         gripper_desc=r(b, CFG.gripper_dim),
         base_desc=r(b, CFG.base_desc_dim),
-        eef_pos=r(b, 3),
-        eef_rot=random_rotations(b),
+        eef_pos=r(b, CFG.num_end_effectors, 3),
+        eef_rot=random_rotations(b, CFG.num_end_effectors),
         lib_pos=r(b, N_W, 3),
         lib_rot=random_rotations(b, N_W),
         lib_cost=r(b, N_W).abs(),
         lib_margin=torch.rand(b, N_W, generator=g),
         ws_mask=ws_mask,
+        lib_ee=(torch.arange(N_W) % CFG.num_end_effectors).expand(b, N_W).clone(),
         ee_mask=torch.full((b, CFG.num_end_effectors), not armless),
         new_episode=torch.zeros(b, dtype=torch.bool) if new_episode is None else new_episode,
     )
@@ -231,3 +232,20 @@ def test_goal_loss_is_zero_for_perfect_prediction_and_masks_absent_effectors():
 def test_config_is_frozen():
     with pytest.raises(dataclasses.FrozenInstanceError):
         CFG.d_model = 64  # type: ignore[misc]
+
+
+def test_goal_workspace_reads_only_own_arm_samples(model):
+    """Capability of end effector 0 must not depend on the library samples of end effector 1."""
+    model.eval()
+    inp = make_inputs()
+    mem = model.init_memory(2)
+    with torch.no_grad():
+        ref = model(inp, mem).capability
+        other = inp.lib_ee == 1
+        inp.lib_pos = torch.where(other[..., None], inp.lib_pos + 5.0, inp.lib_pos)
+        inp.lib_cost = torch.where(other, inp.lib_cost + 3.0, inp.lib_cost)
+        out = model(inp, mem).capability
+    # W_t also feeds the pooled/full workspace tokens of the action stream, but C^G_0 itself
+    # only reads arm-0 samples through the relational attention (context is shared).
+    assert torch.allclose(out[:, 0], ref[:, 0], atol=1e-5)
+    assert not torch.allclose(out[:, 1], ref[:, 1], atol=1e-3)
