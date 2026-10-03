@@ -41,10 +41,15 @@ class MemoryPolicy(base_policy.BasePolicy):
         self.cfg = MobileBenchConfig(**json.load(open(f"{exp_dir}/mobilebench_config.json")))
         self.lib = rme.Library.load(f"{exp_dir}/library.npz")
         self.dev = torch.device("cuda")
-        self.model = train_rmbench.build_model(weights, self.cfg, self.dev)
+        targs = json.load(open(f"{exp_dir}/train_args.json"))
+        self.model = train_rmbench.build_model(
+            weights, self.cfg, self.dev,
+            vlm_lora=targs.get("vlm_lora", False), expert_lora=targs.get("expert_lora", False),
+        )  # fmt: skip
         state = safetensors.torch.load_file(f"{ckpt}/trainable.safetensors", device="cuda")
         missing, unexpected = self.model.load_state_dict(state, strict=False)
-        missing = [k for k in missing if not k.startswith("vlm.")]
+        trainable = {k for k, p in self.model.named_parameters() if p.requires_grad}
+        missing = sorted(trainable - set(state))
         if missing or unexpected:
             raise RuntimeError(f"checkpoint mismatch: missing {missing[:5]} unexpected {unexpected[:5]}")
         self.model.eval()

@@ -62,14 +62,14 @@ def frame_transform(assets_dirs=None):
     return _transforms.compose(tfs), data
 
 
-def build_model(weights: str, mb_cfg: MobileBenchConfig, device) -> MobileBenchPi05:
+def build_model(weights: str, mb_cfg: MobileBenchConfig, device, *, vlm_lora=False, expert_lora=False) -> MobileBenchPi05:
     pcfg = pi0_config.Pi0Config(pi05=True, pytorch_compile_mode=None)
     pi0 = PI0Pytorch(pcfg)
     missing, unexpected = safetensors.torch.load_model(pi0, weights, strict=False)
     if missing or unexpected:
         logging.warning("pi05 weights: %d missing, %d unexpected (e.g. %s)", len(missing), len(unexpected),
                         (missing or unexpected)[:3])  # fmt: skip
-    model = MobileBenchPi05(pi0, mb_cfg)
+    model = MobileBenchPi05(pi0, mb_cfg, vlm_lora=vlm_lora, expert_lora=expert_lora)
     del pi0
     return model.to(device)
 
@@ -105,6 +105,9 @@ def main():
     ap.add_argument("--lr_pretrained", type=float, default=2.5e-5)
     ap.add_argument("--lr_new", type=float, default=1e-4)
     ap.add_argument("--warmup", type=int, default=300)
+    # openpi LoRA recipe of the pi0.5 baseline (gemma_2b_lora + gemma_300m_lora).
+    ap.add_argument("--vlm_lora", action="store_true")
+    ap.add_argument("--expert_lora", action="store_true")
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--save_every", type=int, default=1000)
     ap.add_argument("--log_every", type=int, default=10)
@@ -143,7 +146,7 @@ def main():
         pin_memory=True,
     )
 
-    model = build_model(args.weights, mb_cfg, device)
+    model = build_model(args.weights, mb_cfg, device, vlm_lora=args.vlm_lora, expert_lora=args.expert_lora)
     model.train()
     groups = trainable_parameter_groups(model, args.lr_pretrained, args.lr_new)
     for g in groups:
@@ -209,7 +212,8 @@ def main():
             if step % args.save_every == 0 or step == args.steps:
                 ck = f"{out_dir}/{step}"
                 os.makedirs(ck, exist_ok=True)
-                state = {k: v for k, v in model.state_dict().items() if not k.startswith("vlm.")}
+                # Only what training changes; frozen pretrained weights come from --weights.
+                state = {k: p.detach() for k, p in model.named_parameters() if p.requires_grad}
                 safetensors.torch.save_file({k: v.contiguous() for k, v in state.items()}, f"{ck}/trainable.safetensors")
                 logging.info("saved %s", ck)
             if step >= total_steps:
