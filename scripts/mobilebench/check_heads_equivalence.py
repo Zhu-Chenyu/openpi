@@ -15,8 +15,12 @@ from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 weights = sys.argv[1]
 torch.manual_seed(0)
 dev = torch.device("cuda")
+# Exact fp32 comparison: TF32 matmuls alone give ~1e-2 differences.
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 pi0 = PI0Pytorch(pi0_config.Pi0Config(pi05=True, dtype="float32", pytorch_compile_mode=None))
 safetensors.torch.load_model(pi0, weights, strict=False)
+torch.set_float32_matmul_precision("highest")  # PI0Pytorch.__init__ sets "high"
 pi0 = pi0.to(dev).eval()
 heads = DualActionHeads.from_pi05(pi0, 256).to(dev).eval()
 

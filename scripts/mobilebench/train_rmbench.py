@@ -183,14 +183,17 @@ def main():
                 loss, logs = model.episode_loss(batch, weights)
             optim.zero_grad(set_to_none=True)
             loss.backward()
-            gnorm = torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
+            # Clip per group: the new modules' auxiliary-loss gradients are large early on
+            # and a single global norm would shrink the pretrained expert's FM update with them.
+            gnorms = [torch.nn.utils.clip_grad_norm_(g["params"], 1.0) for g in groups]
             optim.step()
             step += 1
 
             if step % args.log_every == 0 or step == 1:
                 dt = time.time() - t_last
                 logs.update(
-                    grad_norm=float(gnorm),
+                    grad_norm_pretrained=float(gnorms[0]),
+                    grad_norm_new=float(gnorms[1]),
                     lr_pretrained=optim.param_groups[0]["lr"],
                     lr_new=optim.param_groups[1]["lr"],
                     sec_per_step=dt / (args.log_every if step > 1 else 1),

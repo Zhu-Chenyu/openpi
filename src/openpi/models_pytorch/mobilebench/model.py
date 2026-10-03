@@ -85,9 +85,12 @@ class MobileBenchPi05(nn.Module):
             e = self.vlm.model.get_image_features(img)
             embs.append(e)
             pads.append(m[:, None].expand(e.shape[0], e.shape[1]))
-        lang = self.vlm.language_model.embed_tokens(obs.tokenized_prompt)
+        # Prompts are right-padded to max_token_len (200 for pi0.5); the padding is masked
+        # anyway, so drop the columns no sample uses instead of running them through 18 layers.
+        used = max(int(obs.tokenized_prompt_mask.sum(dim=1).max()), 1)
+        lang = self.vlm.language_model.embed_tokens(obs.tokenized_prompt[:, :used])
         embs.append(lang * math.sqrt(lang.shape[-1]))
-        pads.append(obs.tokenized_prompt_mask)
+        pads.append(obs.tokenized_prompt_mask[:, :used])
         dtype = self.vlm.language_model.layers[0].self_attn.q_proj.weight.dtype
         embs = torch.cat(embs, dim=1).to(dtype)
         pad = torch.cat(pads, dim=1)
