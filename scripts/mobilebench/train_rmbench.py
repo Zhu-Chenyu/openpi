@@ -117,6 +117,11 @@ def main():
     ap.add_argument("--max_steps_debug", type=int, default=None, help="stop early (throughput check)")
     ap.add_argument("--baseline_config", default=BASELINE_CONFIG, help="openpi config for transforms + norm stats")
     ap.add_argument(
+        "--ema", type=float, default=0.99,
+        help="EMA decay of the trainable weights (openpi's default 0.99; 0 = off). Checkpoints store the EMA "
+        "weights as trainable.safetensors (what evaluation loads) and the raw ones as trainable_raw.safetensors.",
+    )  # fmt: skip
+    ap.add_argument(
         "--window", type=int, default=0,
         help="TBPTT window in updates (0 = whole episodes per batch). >0 streams episodes through "
         "--episodes_per_batch slots and carries the memory across windows (sec. 9.6).",
@@ -181,6 +186,10 @@ def main():
     n_total = sum(p.numel() for p in model.parameters())
     logging.info("params: %.1fM trainable / %.1fM total", n_train / 1e6, n_total / 1e6)
     optim = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=1e-10, eps=1e-8)
+    train_named = [(k, p) for k, p in model.named_parameters() if p.requires_grad]
+    train_params = [p for _, p in train_named]
+    # fp32 shadow copy, updated after every optimizer step: w_ema = d * w_ema + (1 - d) * w.
+    ema = [p.detach().clone().float() for p in train_params] if args.ema > 0 else None
     weights = LossWeights()
     # RMBench put_back_block: 14 real action dims (left 6+1, right 6+1) of the padded 32.
     action_mask = torch.zeros(model.action_dim, dtype=torch.bool, device=device)
@@ -217,6 +226,10 @@ def main():
         # and a single global norm would shrink the pretrained expert's FM update with them.
         gnorms = [torch.nn.utils.clip_grad_norm_(g["params"], 1.0) for g in groups]
         optim.step()
+        if ema is not None:
+            with torch.no_grad():
+                torch._foreach_mul_(ema, args.ema)
+                torch._foreach_add_(ema, [p.float() for p in train_params], alpha=1.0 - args.ema)
         step += 1
 
         if step % args.log_every == 0 or step == 1:
@@ -241,8 +254,13 @@ def main():
             ck = f"{out_dir}/{step}"
             os.makedirs(ck, exist_ok=True)
             # Only what training changes; frozen pretrained weights come from --weights.
-            state = {k: p.detach() for k, p in model.named_parameters() if p.requires_grad}
-            safetensors.torch.save_file({k: v.contiguous() for k, v in state.items()}, f"{ck}/trainable.safetensors")
+            raw = {k: p.detach().contiguous() for k, p in train_named}
+            if ema is not None:
+                safetensors.torch.save_file(raw, f"{ck}/trainable_raw.safetensors")
+                ema_state = {k: e.to(p.dtype).contiguous() for (k, p), e in zip(train_named, ema, strict=True)}
+                safetensors.torch.save_file(ema_state, f"{ck}/trainable.safetensors")
+            else:
+                safetensors.torch.save_file(raw, f"{ck}/trainable.safetensors")
             logging.info("saved %s (%d frames seen)", ck, frames_seen)
     if run is not None:
         run.finish()
