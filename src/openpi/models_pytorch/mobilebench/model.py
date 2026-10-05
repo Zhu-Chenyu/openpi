@@ -243,7 +243,9 @@ class MobileBenchPi05(nn.Module):
         return act_u, act_b, out
 
     # -- episode-sequence training ---------------------------------------------------------------
-    def episode_loss(self, batch: dict, weights: LossWeights) -> tuple[Tensor, dict[str, float]]:
+    def episode_loss(
+        self, batch: dict, weights: LossWeights, memory: MemoryState | None = None
+    ) -> tuple[Tensor, dict[str, float], MemoryState]:
         """batch (see scripts/mobilebench/rmbench_episodes.py):
         observation   openpi Observation of the N ACTIVE update frames (flattened b-major)
         slot, update  [N] long: (episode slot, update index) of each active frame
@@ -251,6 +253,9 @@ class MobileBenchPi05(nn.Module):
         actions       [N, H, A] normalised clean action chunks, action_mask [N, A]
         step          dict of [B, U, ...] StepInputs fields (everything except h / h_mask)
         labels        dict of [B, U, ...] label tensors
+        memory        memory carried from the previous TBPTT window (None = fresh slots). Slots whose
+                      first update has step["new_episode"] are reset inside the conditioner.
+        Returns (loss, logs, memory after the window, DETACHED -- the TBPTT boundary).
         """
         active = batch["active"]
         b, u = active.shape
@@ -262,7 +267,8 @@ class MobileBenchPi05(nn.Module):
         h[slot, upd], h_mask[slot, upd] = h_flat, pad_flat
 
         step = batch["step"]
-        memory = self.conditioner.init_memory(b, h.device)
+        if memory is None:
+            memory = self.conditioner.init_memory(b, h.device)
         outs: list[StepOutputs] = []
         for k in range(u):
             fields = {name: v[:, k] for name, v in step.items()}
@@ -284,12 +290,13 @@ class MobileBenchPi05(nn.Module):
         act = active.flatten()
         present = lambda m: m & act.view(-1, *([1] * (m.dim() - 1)))  # noqa: E731
 
+        obs_present = present(flat.get("aff_obs_present", flat["aff_present"]))
         aff_obs = L.point_loss(stack(lambda o: o.a_obs.points), flat["aff_point"], flat["aff_obs_valid"],
-                               present(flat["aff_present"]))  # fmt: skip
+                               obs_present)  # fmt: skip
         aff_use = L.point_loss(stack(lambda o: o.a_use.points), flat["aff_point"], flat["aff_use_valid"],
                                present(flat["aff_present"]))  # fmt: skip
         valid = L.validity_loss(stack(lambda o: o.a_obs.valid_logits), flat["aff_obs_valid"],
-                                present(flat["aff_present"])) + L.validity_loss(
+                                obs_present) + L.validity_loss(
             stack(lambda o: o.a_use.valid_logits), flat["aff_use_valid"], present(flat["aff_present"])
         )  # fmt: skip
         ee_mask = step["ee_mask"].flatten(0, 1)
@@ -330,9 +337,9 @@ class MobileBenchPi05(nn.Module):
             "mode": mode.item(),
             "aff_use_obj_err_m": aff_err.item(),
             "goal_pos_err_m": g_err.item(),
-            "updates_per_episode": act.sum().item() / b,
+            "updates_per_slot": act.sum().item() / b,
         }
-        return total, logs
+        return total, logs, memory.detach()
 
 
 def trainable_parameter_groups(model: MobileBenchPi05, lr_pretrained: float, lr_new: float):

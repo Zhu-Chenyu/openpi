@@ -57,7 +57,7 @@ for n_eps in (4, 8):
         torch.cuda.synchronize()
         t = time.time()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, logs = model.episode_loss(b, LossWeights())
+            loss, logs, _ = model.episode_loss(b, LossWeights())
         opt.zero_grad()
         loss.backward()
         opt.step()

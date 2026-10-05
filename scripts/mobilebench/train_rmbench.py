@@ -39,6 +39,7 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch  # noqa: E402
 from openpi.training import config as _config  # noqa: E402
 import openpi.transforms as _transforms  # noqa: E402
 
+# The pi0.5 LoRA baseline config whose data transforms / norm stats both runs share.
 BASELINE_CONFIG = "pi05_rmbench_put_back_block_lora"
 
 
@@ -50,8 +51,8 @@ def mobilebench_config() -> MobileBenchConfig:
     )
 
 
-def frame_transform(assets_dirs=None):
-    cfg = _config.get_config(BASELINE_CONFIG)
+def frame_transform(assets_dirs=None, config_name: str = BASELINE_CONFIG):
+    cfg = _config.get_config(config_name)
     data = cfg.data.create(assets_dirs or cfg.assets_dirs, cfg.model)
     tfs = [
         *data.repack_transforms.inputs,
@@ -114,6 +115,12 @@ def main():
     ap.add_argument("--wandb_project", default="rmbench-pi05")
     ap.add_argument("--no_wandb", action="store_true")
     ap.add_argument("--max_steps_debug", type=int, default=None, help="stop early (throughput check)")
+    ap.add_argument("--baseline_config", default=BASELINE_CONFIG, help="openpi config for transforms + norm stats")
+    ap.add_argument(
+        "--window", type=int, default=0,
+        help="TBPTT window in updates (0 = whole episodes per batch). >0 streams episodes through "
+        "--episodes_per_batch slots and carries the memory across windows (sec. 9.6).",
+    )  # fmt: skip
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", force=True)
@@ -124,27 +131,46 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     mb_cfg = mobilebench_config()
-    tf, data_cfg = frame_transform()
+    tf, data_cfg = frame_transform(config_name=args.baseline_config)
     meta = np.load(f"{args.data}/meta.npz")
     lib = rme.Library.build(meta["state"])
     lib.save(f"{out_dir}/library.npz")
     json.dump(dataclasses.asdict(mb_cfg), open(f"{out_dir}/mobilebench_config.json", "w"), indent=1)
     json.dump(vars(args), open(f"{out_dir}/train_args.json", "w"), indent=1)
     # Norm stats travel with the checkpoint so evaluation un-normalises exactly like training.
-    shutil.copytree(_config.get_config(BASELINE_CONFIG).assets_dirs, f"{out_dir}/assets", dirs_exist_ok=True)
+    shutil.copytree(_config.get_config(args.baseline_config).assets_dirs, f"{out_dir}/assets", dirs_exist_ok=True)
 
     ds = rme.EpisodeSequences(args.data, tf, mb_cfg, lib, stride=args.stride, trace_lags=4)
-    loader = torch.utils.data.DataLoader(
-        ds,
-        batch_size=args.episodes_per_batch,
-        shuffle=True,
-        drop_last=True,
-        num_workers=args.workers,
-        collate_fn=rme.collate,
-        persistent_workers=True,
-        prefetch_factor=4,
-        pin_memory=True,
-    )
+    if args.window > 0:
+        ep_loader = torch.utils.data.DataLoader(
+            ds, batch_size=1, shuffle=True, num_workers=args.workers, collate_fn=rme.first,
+            persistent_workers=True, prefetch_factor=4,
+        )  # fmt: skip
+
+        def episodes():
+            while True:
+                yield from ep_loader
+
+        stream = rme.WindowStream(episodes(), slots=args.episodes_per_batch, window=args.window)
+        batches = iter(stream.next_batch, None)
+    else:
+        loader = torch.utils.data.DataLoader(
+            ds,
+            batch_size=args.episodes_per_batch,
+            shuffle=True,
+            drop_last=True,
+            num_workers=args.workers,
+            collate_fn=rme.collate,
+            persistent_workers=True,
+            prefetch_factor=4,
+            pin_memory=True,
+        )
+
+        def whole_episodes():
+            while True:
+                yield from loader
+
+        batches = whole_episodes()
 
     model = build_model(args.weights, mb_cfg, device, vlm_lora=args.vlm_lora, expert_lora=args.expert_lora)
     model.train()
@@ -166,59 +192,58 @@ def main():
 
         run = wandb.init(project=args.wandb_project, name=args.exp, config={**vars(args), **dataclasses.asdict(mb_cfg)})
 
-    step = 0
+    step, frames_seen, memory = 0, 0, None
     t_last, wait_acc, frames_acc = time.time(), 0.0, 0
     total_steps = args.max_steps_debug or args.steps
     while step < total_steps:
         t_wait = time.time()
-        for batch in loader:
-            wait_acc += time.time() - t_wait
-            batch = to_device(batch, device)
-            obs = _model.Observation.from_dict(batch["observation"])
-            n = batch["actions"].shape[0]
-            frames_acc += n
-            batch["observation"] = obs
-            batch["action_mask"] = action_mask[None].expand(n, -1)
-            scale = lr_at(step, args.warmup, args.steps)
-            for g in optim.param_groups:
-                g["lr"] = g["base_lr"] * scale
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, logs = model.episode_loss(batch, weights)
-            optim.zero_grad(set_to_none=True)
-            loss.backward()
-            # Clip per group: the new modules' auxiliary-loss gradients are large early on
-            # and a single global norm would shrink the pretrained expert's FM update with them.
-            gnorms = [torch.nn.utils.clip_grad_norm_(g["params"], 1.0) for g in groups]
-            optim.step()
-            step += 1
+        batch = next(batches)
+        wait_acc += time.time() - t_wait
+        batch = to_device(batch, device)
+        obs = _model.Observation.from_dict(batch["observation"])
+        n = batch["actions"].shape[0]
+        frames_acc += n
+        frames_seen += n
+        batch["observation"] = obs
+        batch["action_mask"] = action_mask[None].expand(n, -1)
+        scale = lr_at(step, args.warmup, args.steps)
+        for g in optim.param_groups:
+            g["lr"] = g["base_lr"] * scale
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss, logs, memory = model.episode_loss(batch, weights, memory if args.window > 0 else None)
+        optim.zero_grad(set_to_none=True)
+        loss.backward()
+        # Clip per group: the new modules' auxiliary-loss gradients are large early on
+        # and a single global norm would shrink the pretrained expert's FM update with them.
+        gnorms = [torch.nn.utils.clip_grad_norm_(g["params"], 1.0) for g in groups]
+        optim.step()
+        step += 1
 
-            if step % args.log_every == 0 or step == 1:
-                dt = time.time() - t_last
-                logs.update(
-                    grad_norm_pretrained=float(gnorms[0]),
-                    grad_norm_new=float(gnorms[1]),
-                    lr_pretrained=optim.param_groups[0]["lr"],
-                    lr_new=optim.param_groups[1]["lr"],
-                    sec_per_step=dt / (args.log_every if step > 1 else 1),
-                    frames_per_sec=frames_acc / dt,
-                    data_wait_frac=wait_acc / dt,
-                    gpu_mem_gb=torch.cuda.max_memory_allocated() / 1e9,
-                )
-                logging.info("step %d %s", step, " ".join(f"{k}={v:.4g}" for k, v in logs.items()))
-                if run is not None:
-                    run.log(logs, step=step)
-                t_last, wait_acc, frames_acc = time.time(), 0.0, 0
+        if step % args.log_every == 0 or step == 1:
+            dt = time.time() - t_last
+            logs.update(
+                grad_norm_pretrained=float(gnorms[0]),
+                grad_norm_new=float(gnorms[1]),
+                lr_pretrained=optim.param_groups[0]["lr"],
+                lr_new=optim.param_groups[1]["lr"],
+                sec_per_step=dt / (args.log_every if step > 1 else 1),
+                frames_per_sec=frames_acc / dt,
+                frames_seen=frames_seen,
+                data_wait_frac=wait_acc / dt,
+                gpu_mem_gb=torch.cuda.max_memory_allocated() / 1e9,
+            )
+            logging.info("step %d %s", step, " ".join(f"{k}={v:.4g}" for k, v in logs.items()))
+            if run is not None:
+                run.log(logs, step=step)
+            t_last, wait_acc, frames_acc = time.time(), 0.0, 0
 
-            if step % args.save_every == 0 or step == args.steps:
-                ck = f"{out_dir}/{step}"
-                os.makedirs(ck, exist_ok=True)
-                # Only what training changes; frozen pretrained weights come from --weights.
-                state = {k: p.detach() for k, p in model.named_parameters() if p.requires_grad}
-                safetensors.torch.save_file({k: v.contiguous() for k, v in state.items()}, f"{ck}/trainable.safetensors")
-                logging.info("saved %s", ck)
-            if step >= total_steps:
-                break
-            t_wait = time.time()
+        if step % args.save_every == 0 or step == args.steps:
+            ck = f"{out_dir}/{step}"
+            os.makedirs(ck, exist_ok=True)
+            # Only what training changes; frozen pretrained weights come from --weights.
+            state = {k: p.detach() for k, p in model.named_parameters() if p.requires_grad}
+            safetensors.torch.save_file({k: v.contiguous() for k, v in state.items()}, f"{ck}/trainable.safetensors")
+            logging.info("saved %s (%d frames seen)", ck, frames_seen)
     if run is not None:
         run.finish()
 

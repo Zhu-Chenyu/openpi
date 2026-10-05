@@ -624,6 +624,56 @@ _CONFIGS = [
         wandb_enabled=False,
         fsdp_devices=1,
     ),
+    # Same recipe on all 10 RMBench tasks (2449 episodes / 1.6M frames): the LeRobot
+    # view `rmbench/ten_task` of gr00t_rmbench10_instruction_only, where each frame's
+    # prompt is its task's single fixed instruction (scripts/rmbench/make_instruction_only.py
+    # in Memory-Augmented-VLA). Step budget: 62.5k x 16 = 1M frames, matched by the
+    # MobileBench run trained alongside it.
+    TrainConfig(
+        name="pi05_rmbench_ten_task_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="rmbench/ten_task",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head",
+                                "cam_left_wrist": "observation.images.front",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=62_500),
+        num_train_steps=62_500,
+        batch_size=16,
+        num_workers=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=5000,
+        wandb_enabled=False,
+        fsdp_devices=1,
+    ),
     #
     # Inference Aloha configs.
     #

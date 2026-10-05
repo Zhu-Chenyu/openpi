@@ -143,7 +143,16 @@ class EpisodeSequences(torch.utils.data.Dataset):
         self.cfg, self.lib = cfg, lib
         self.stride, self.horizon, self.lags, self.train = stride, horizon, trace_lags, train
         self.cams = cams
-        self.prompt = str(self.meta["prompt"])
+        n_eps = len(self.meta["ep_index"])
+        if "prompts" in self.meta:  # multi-task prep
+            self.prompts = [str(p) for p in self.meta["prompts"]]
+            self.ep_prompt = self.meta["ep_prompt"]
+            self.ep_task = [str(t) for t in self.meta["ep_task"]]
+        else:  # single-task put_back_block prep
+            self.prompts = [str(self.meta["prompt"])]
+            self.ep_prompt = np.zeros(n_eps, int)
+            self.ep_task = ["put_back_block"] * n_eps
+        self.video_root = str(self.meta.get("video_root", ""))
         self.dt = stride / float(self.meta["fps"])
         self.events = {}
         for e, f, a, c in self.meta["events"]:
@@ -153,21 +162,46 @@ class EpisodeSequences(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.meta["ep_index"])
 
-    def _images(self):
-        if self._img is None:  # opened lazily so every DataLoader worker has its own handles
-            self._img = {c: np.load(f"{self.dir}/images_{c}.npy", mmap_mode="r") for c in self.cams}
-        return self._img
+    def _frames(self, ep: int, s0: int, n: int, frames: np.ndarray) -> dict:
+        """{cam: uint8 [len(frames), H, W, 3]} from the memmaps, or decoded from the episode mp4s."""
+        if not self.video_root:
+            if self._img is None:  # opened lazily so every DataLoader worker has its own handles
+                self._img = {c: np.load(f"{self.dir}/images_{c}.npy", mmap_mode="r") for c in self.cams}
+            return {c: self._img[c][s0 + frames] for c in self.cams}
+        import av
+
+        out = {}
+        want = set(int(t) for t in frames)
+        last = int(frames.max())
+        for c in self.cams:
+            path = f"{self.video_root}/videos/chunk-{ep // 1000:03d}/observation.images.{c}/episode_{ep:06d}.mp4"
+            got = {}
+            with av.open(path) as con:
+                for t, fr in enumerate(con.decode(video=0)):
+                    if t in want:
+                        got[t] = fr.to_ndarray(format="rgb24")
+                    if t >= last:
+                        break
+            final = got[max(got)]  # a video a frame shorter than the parquet: hold the last frame
+            out[c] = np.stack([got.get(int(t), final) for t in frames])
+        return out
 
     # -- labels ----------------------------------------------------------------------------------
-    def _labels(self, ep: int, s0: int, frames: np.ndarray) -> dict:
-        ev = self.events[ep]
+    def _labels(self, ep: int, s0: int, frames: np.ndarray, task: str) -> dict:
+        ev = self.events.get(ep, [])
         pos, rot, st = self.meta["tcp_pos"], self.meta["tcp_rot"], self.meta["state"]
+        # "Knowable from the current image" needs a per-task rule. Only put_back_block has one
+        # (its final return to the original mat is recall-only); on other tasks the CURRENT
+        # branch is left unlabelled rather than given a guessed label (sec. 9.3: "no label"
+        # and "truly invalid" are different states). The JOINT branch is labelled everywhere.
+        obs_rule = task == "put_back_block"
         right_opens = [f for f, a, c in ev if a == 1 and c == 0]
-        recall_only = right_opens[-1] if len(right_opens) >= 2 else None
+        recall_only = right_opens[-1] if obs_rule and len(right_opens) >= 2 else None
         u = len(frames)
         lab = {
             "aff_point": np.zeros((u, 2, 3), np.float32),
             "aff_present": np.ones((u, 2), bool),
+            "aff_obs_present": np.full((u, 2), obs_rule),
             "aff_obs_valid": np.zeros((u, 2), bool),
             "aff_use_valid": np.zeros((u, 2), bool),
             "goal_pos": np.zeros((u, NUM_EE, 3), np.float32),
@@ -211,19 +245,20 @@ class EpisodeSequences(torch.utils.data.Dataset):
         s0, n = int(self.meta["ep_start"][i]), int(self.meta["ep_len"][i])
         off = np.random.randint(self.stride) if self.train else 0
         frames = np.arange(off, n, self.stride)
-        imgs = self._images()
+        imgs = self._frames(ep, s0, n, frames)
+        task, prompt = self.ep_task[i], self.prompts[int(self.ep_prompt[i])]
         state, action = self.meta["state"], self.meta["action"]
         obs, steps = [], []
         prev = None
-        for t in frames:
+        for k, t in enumerate(frames):
             chunk = np.clip(np.arange(t, t + self.horizon), 0, n - 1)  # LeRobot-style clamp at the end
             d = self.tf(
                 {
-                    "observation.images.head": np.ascontiguousarray(imgs["head"][s0 + t].transpose(2, 0, 1)),
-                    "observation.images.front": np.ascontiguousarray(imgs["front"][s0 + t].transpose(2, 0, 1)),
+                    "observation.images.head": np.ascontiguousarray(imgs["head"][k].transpose(2, 0, 1)),
+                    "observation.images.front": np.ascontiguousarray(imgs["front"][k].transpose(2, 0, 1)),
                     "observation.state": state[s0 + t],
                     "action": action[s0 + chunk],
-                    "prompt": self.prompt,
+                    "prompt": prompt,
                 }
             )
             obs.append(d)
@@ -232,8 +267,9 @@ class EpisodeSequences(torch.utils.data.Dataset):
         return {
             "obs": obs,
             "step": {k: np.stack([s[k] for s in steps]) for k in steps[0]},
-            "labels": self._labels(ep, s0, frames),
+            "labels": self._labels(ep, s0, frames, task),
             "episode": ep,
+            "task": task,
         }
 
 
@@ -276,4 +312,49 @@ def collate(items: list[dict]) -> dict:
         "step": {k: pad([it["step"][k] for it in items]) for k in items[0]["step"]},
         "labels": {k: pad([it["labels"][k] for it in items]) for k in items[0]["labels"]},
         "episodes": [it["episode"] for it in items],
+        "tasks": [it.get("task") for it in items],
     }
+
+
+def first(items: list):
+    """DataLoader collate_fn for batch_size=1 that keeps the raw (numpy) episode item."""
+    return items[0]
+
+
+def slice_item(item: dict, a: int, b: int) -> dict:
+    """Updates [a, b) of an episode item (labels were computed with full-episode context)."""
+    return {
+        "obs": item["obs"][a:b],
+        "step": {k: v[a:b] for k, v in item["step"].items()},
+        "labels": {k: v[a:b] for k, v in item["labels"].items()},
+        "episode": item["episode"],
+        "task": item["task"],
+    }
+
+
+class WindowStream:
+    """Truncated-BPTT stream (design doc sec. 9.6-9.7).
+
+    Each of `slots` batch slots walks through one episode at a time in windows of `window`
+    consecutive policy updates. The model carries every slot's memory from one window to
+    the next (detached at the boundary, NOT cleared); the first update of a new episode has
+    step["new_episode"] = True, which resets only that slot. A window never spans two
+    episodes: a slot whose episode ends mid-window is padded (inactive) and starts its next
+    episode in the next batch. Sampling is therefore frame-weighted, like random-frame
+    training. Episodes come from `episodes`, an iterator of single episode items.
+    """
+
+    def __init__(self, episodes, slots: int, window: int):
+        self.episodes, self.window = episodes, window
+        self.cur = [None] * slots
+        self.pos = [0] * slots
+
+    def next_batch(self) -> dict:
+        items = []
+        for s in range(len(self.cur)):
+            if self.cur[s] is None or self.pos[s] >= len(self.cur[s]["obs"]):
+                self.cur[s], self.pos[s] = next(self.episodes), 0
+            a = self.pos[s]
+            items.append(slice_item(self.cur[s], a, a + self.window))
+            self.pos[s] = a + self.window
+        return collate(items)

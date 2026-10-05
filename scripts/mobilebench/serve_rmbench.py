@@ -53,7 +53,9 @@ class MemoryPolicy(base_policy.BasePolicy):
         if missing or unexpected:
             raise RuntimeError(f"checkpoint mismatch: missing {missing[:5]} unexpected {unexpected[:5]}")
         self.model.eval()
-        _, data = train_rmbench.frame_transform(f"{exp_dir}/assets")
+        _, data = train_rmbench.frame_transform(
+            f"{exp_dir}/assets", config_name=targs.get("baseline_config", train_rmbench.BASELINE_CONFIG)
+        )
         norm = _transforms.Normalize(data.norm_stats, use_quantiles=data.use_quantile_norm)
         unnorm = _transforms.Unnormalize(data.norm_stats, use_quantiles=data.use_quantile_norm)
         self.input_tf = _transforms.compose([*data.data_transforms.inputs, norm, *data.model_transforms.inputs])

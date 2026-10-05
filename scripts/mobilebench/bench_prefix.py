@@ -44,7 +44,7 @@ for impl in ("eager", "sdpa"):
         tp = timeit(lambda: model.encode_prefix(batch["observation"], train=True))
 
         def full():
-            loss, _ = model.episode_loss(batch, LossWeights())
+            loss, *_ = model.episode_loss(batch, LossWeights())
             loss.backward()
 
         tf_ = timeit(full)
