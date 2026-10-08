@@ -1,7 +1,7 @@
 """See _CONFIGS for the list of available configs."""
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import dataclasses
 import difflib
 import logging
@@ -89,6 +89,10 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # Optional {task name: share of sampled frames}; the remaining share is split over the other tasks in
+    # proportion to their frames (see openpi.training.task_mix). Task names come from the "rmbench_task" field
+    # of meta/episodes.jsonl. None = plain uniform-frame shuffling.
+    task_frame_shares: Mapping[str, float] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -666,6 +670,59 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=62_500),
         num_train_steps=62_500,
+        batch_size=16,
+        num_workers=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=5000,
+        wandb_enabled=False,
+        fsdp_devices=1,
+    ),
+    # Stage 2 for a put_back_block evaluation: continue the ten-task run from its step-45k
+    # checkpoint (720k frames, EMA params; fresh optimizer + warmup/cosine) with put_back_block
+    # upweighted to 30% of the sampled frames (it is 5.4% of the plain mix). 37.5k x 16 = 600k
+    # frames -> put_back_block ~220k frames in total (~2.5 passes). Matched by the MobileBench run
+    # continued from its 27.5k checkpoint (716k frames) with the same mix and frame budget.
+    TrainConfig(
+        name="pi05_rmbench_ten_task_pb30_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="rmbench/ten_task",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head",
+                                "cam_left_wrist": "observation.images.front",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                task_frame_shares={"put_back_block": 0.3},
+            ),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/dfv1344/openpi_checkpoints/pi05_rmbench_ten_task_lora/ten_task_v1/45000/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=37_500),
+        num_train_steps=37_500,
         batch_size=16,
         num_workers=8,
         log_interval=50,

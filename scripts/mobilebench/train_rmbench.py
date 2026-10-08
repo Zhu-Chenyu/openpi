@@ -37,6 +37,7 @@ from openpi.models_pytorch.mobilebench.model import MobileBenchPi05  # noqa: E40
 from openpi.models_pytorch.mobilebench.model import trainable_parameter_groups  # noqa: E402
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch  # noqa: E402
 from openpi.training import config as _config  # noqa: E402
+from openpi.training import task_mix  # noqa: E402
 import openpi.transforms as _transforms  # noqa: E402
 
 # The pi0.5 LoRA baseline config whose data transforms / norm stats both runs share.
@@ -126,6 +127,17 @@ def main():
         help="TBPTT window in updates (0 = whole episodes per batch). >0 streams episodes through "
         "--episodes_per_batch slots and carries the memory across windows (sec. 9.6).",
     )  # fmt: skip
+    ap.add_argument(
+        "--init_ckpt", default=None,
+        help="continue from <exp>/<step> of an earlier run: its trainable.safetensors (EMA weights) initialise the "
+        "model and the EMA shadow; optimizer, LR schedule (warmup + cosine) and step counter start fresh.",
+    )  # fmt: skip
+    ap.add_argument("--init_frames", type=int, default=0, help="frames the --init_ckpt run had seen (logging offset)")
+    ap.add_argument(
+        "--task_shares", default=None,
+        help='e.g. "put_back_block=0.3": that task gets 30%% of the sampled frames, the rest split over the other '
+        "tasks by their frames (openpi.training.task_mix). Default: frame-proportional.",
+    )  # fmt: skip
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", force=True)
@@ -138,7 +150,10 @@ def main():
     mb_cfg = mobilebench_config()
     tf, data_cfg = frame_transform(config_name=args.baseline_config)
     meta = np.load(f"{args.data}/meta.npz")
-    lib = rme.Library.build(meta["state"])
+    if args.init_ckpt:  # the workspace library must be the one the init weights were trained with
+        lib = rme.Library.load(f"{os.path.dirname(args.init_ckpt.rstrip('/'))}/library.npz")
+    else:
+        lib = rme.Library.build(meta["state"])
     lib.save(f"{out_dir}/library.npz")
     json.dump(dataclasses.asdict(mb_cfg), open(f"{out_dir}/mobilebench_config.json", "w"), indent=1)
     json.dump(vars(args), open(f"{out_dir}/train_args.json", "w"), indent=1)
@@ -146,10 +161,17 @@ def main():
     shutil.copytree(_config.get_config(args.baseline_config).assets_dirs, f"{out_dir}/assets", dirs_exist_ok=True)
 
     ds = rme.EpisodeSequences(args.data, tf, mb_cfg, lib, stride=args.stride, trace_lags=4)
+    sampler = None
+    if args.task_shares:
+        shares = {k: float(v) for k, v in (kv.split("=") for kv in args.task_shares.split(","))}
+        # One draw = one whole episode, so per-episode task weights give frame shares (task_mix docstring).
+        w = task_mix.task_weights(ds.ep_task, meta["ep_len"], shares)
+        logging.info("task frame shares: %s", {k: round(v, 3) for k, v in task_mix.frame_shares(ds.ep_task, meta["ep_len"], w).items()})
+        sampler = torch.utils.data.WeightedRandomSampler(torch.as_tensor(w), num_samples=len(ds), replacement=True)
     if args.window > 0:
         ep_loader = torch.utils.data.DataLoader(
-            ds, batch_size=1, shuffle=True, num_workers=args.workers, collate_fn=rme.first,
-            persistent_workers=True, prefetch_factor=4,
+            ds, batch_size=1, shuffle=sampler is None, sampler=sampler, num_workers=args.workers,
+            collate_fn=rme.first, persistent_workers=True, prefetch_factor=4,
         )  # fmt: skip
 
         def episodes():
@@ -162,7 +184,8 @@ def main():
         loader = torch.utils.data.DataLoader(
             ds,
             batch_size=args.episodes_per_batch,
-            shuffle=True,
+            shuffle=sampler is None,
+            sampler=sampler,
             drop_last=True,
             num_workers=args.workers,
             collate_fn=rme.collate,
@@ -178,6 +201,13 @@ def main():
         batches = whole_episodes()
 
     model = build_model(args.weights, mb_cfg, device, vlm_lora=args.vlm_lora, expert_lora=args.expert_lora)
+    if args.init_ckpt:
+        state = safetensors.torch.load_file(f"{args.init_ckpt}/trainable.safetensors", device=str(device))
+        _, unexpected = model.load_state_dict(state, strict=False)
+        missing = sorted({k for k, p in model.named_parameters() if p.requires_grad} - set(state))
+        if missing or unexpected:
+            raise RuntimeError(f"--init_ckpt mismatch: missing {missing[:5]} unexpected {unexpected[:5]}")
+        logging.info("initialised %d trainable tensors from %s", len(state), args.init_ckpt)
     model.train()
     groups = trainable_parameter_groups(model, args.lr_pretrained, args.lr_new)
     for g in groups:
@@ -201,7 +231,7 @@ def main():
 
         run = wandb.init(project=args.wandb_project, name=args.exp, config={**vars(args), **dataclasses.asdict(mb_cfg)})
 
-    step, frames_seen, memory = 0, 0, None
+    step, frames_seen, memory = 0, args.init_frames, None
     t_last, wait_acc, frames_acc = time.time(), 0.0, 0
     total_steps = args.max_steps_debug or args.steps
     while step < total_steps:

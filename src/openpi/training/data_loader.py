@@ -13,6 +13,7 @@ import torch
 
 import openpi.models.model as _model
 import openpi.training.config as _config
+import openpi.training.task_mix as _task_mix
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
@@ -268,6 +269,33 @@ def create_data_loader(
     )
 
 
+def _task_weighted_sampler(data_config: _config.DataConfig, seed: int) -> torch.utils.data.Sampler:
+    """Frame sampler giving each task its `data_config.task_frame_shares` share (see openpi.training.task_mix).
+
+    Frames are drawn with replacement; one "epoch" of the sampler is as many draws as the dataset has frames.
+    """
+    import json
+
+    meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+    episodes = {}
+    with open(meta.root / "meta" / "episodes.jsonl") as f:
+        for line in f:
+            e = json.loads(line)
+            episodes[e["episode_index"]] = (e["rmbench_task"], int(e["length"]))
+    # Same frame order as LeRobotDataset (episodes in index order, frames in order), checked against total_frames.
+    frame_task = np.concatenate([[episodes[e][0]] * episodes[e][1] for e in sorted(episodes)])
+    if len(frame_task) != meta.total_frames:
+        raise ValueError(f"episodes.jsonl lengths sum to {len(frame_task)}, dataset has {meta.total_frames} frames")
+    weights = _task_mix.task_weights(frame_task, np.ones(len(frame_task)), data_config.task_frame_shares)
+    shares = _task_mix.frame_shares(frame_task, np.ones(len(frame_task)), weights)
+    logging.info("task-weighted sampling, frame shares: %s", {k: round(v, 3) for k, v in shares.items()})
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.WeightedRandomSampler(
+        torch.as_tensor(weights), num_samples=len(frame_task), replacement=True, generator=generator
+    )
+
+
 def create_torch_data_loader(
     data_config: _config.DataConfig,
     model_config: _model.BaseModelConfig,
@@ -300,13 +328,16 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    task_sampler = _task_weighted_sampler(data_config, seed) if data_config.task_frame_shares else None
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
-    sampler = None
+    sampler = task_sampler
     if framework == "pytorch":
+        if task_sampler is not None and torch.distributed.is_initialized():
+            raise NotImplementedError("task_frame_shares is not supported with DDP")
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,
