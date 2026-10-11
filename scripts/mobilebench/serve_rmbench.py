@@ -9,8 +9,14 @@ first call of every episode.
     python scripts/mobilebench/serve_rmbench.py --ckpt <out>/<exp>/<step> --port 8765
 
 Request: {"images": {"cam_high": CHW uint8, "cam_left_wrist": CHW uint8}, "state": [14],
-          "prompt": str, "reset": bool}
+          "prompt": str, "reset": bool, optional "commit": bool, "prev_state": [14]}
 Reply:   {"actions": [50, 14]} absolute joint targets, like the openpi pi0.5 policy.
+
+Re-planning between memory writes: the memory was trained at one write per `stride` frames,
+so a client that re-plans every K < stride frames sends `commit=False` on the in-between
+calls. Those read the memory from the last committed update and do not write it; their
+executed increment is taken from `prev_state` (the state `stride` frames earlier, when the
+client has it), so the conditioner sees the same dt / increment scale as in training.
 """
 
 import argparse
@@ -76,18 +82,23 @@ class MemoryPolicy(base_policy.BasePolicy):
             self.dev,
         )  # fmt: skip
         observation = _model.Observation.from_dict(batch)
-        fields = rme.step_inputs(state14, self.prev, self.dt, self.lib, np.asarray(d["state"]), self.cfg)
+        commit = bool(obs.get("commit", True))
+        prev = self.prev
+        if not commit and obs.get("prev_state") is not None and self.prev is not None:
+            prev = np.asarray(obs["prev_state"], np.float32)
+        fields = rme.step_inputs(state14, prev, self.dt, self.lib, np.asarray(d["state"]), self.cfg)
         fields = {k: torch.as_tensor(np.asarray(v))[None].to(self.dev) for k, v in fields.items()}
         step = StepInputs(h=None, h_mask=None, **fields)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             act, _, out = self.model.infer(observation, step, self.memory, num_steps=self.num_steps)
-        self.memory, self.prev = out.memory, state14
-        self.updates += 1
+        if commit:
+            self.memory, self.prev = out.memory, state14
+            self.updates += 1
         actions = act[0].float().cpu().numpy()
         res = self.output_tf({"state": np.asarray(d["state"]), "actions": actions})
         logging.info(
-            "update %d: slow_written=%s  A_use obj=%s (valid %.2f)  goal L/R valid=%s",
-            self.updates, bool(out.slow_written[0]),
+            "update %d%s: slow_written=%s  A_use obj=%s (valid %.2f)  goal L/R valid=%s",
+            self.updates, "" if commit else " (re-plan, not committed)", bool(out.slow_written[0]),
             np.round(out.a_use.points[0, 1].float().cpu().numpy(), 3),
             out.a_use.valid_logits[0, 1].sigmoid().item(),
             np.round(out.goal.valid_logits[0].sigmoid().float().cpu().numpy(), 2),
