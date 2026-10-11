@@ -27,9 +27,11 @@ WEIGHTS = "/data/users/dfv1344/openpi_data/pi05_base_pytorch/model.safetensors"
 
 def run(ckpt, meta, imgs, eps, prompt):
     pol = serve_rmbench.MemoryPolicy(ckpt, WEIGHTS)
-    joint, tcp, tcp_end, grip = [], [], [], []
+    joint, tcp, tcp_end, grip, press = [], [], [], [], []
     for e in eps:
         s0, n = int(meta["ep_start"][e]), int(meta["ep_len"][e])
+        # Button press = the left TCP's lowest point in the episode (put_back_block: left arm only presses).
+        z_press = meta["tcp_pos"][s0 : s0 + n, 0, 2].min()
         for u, t in enumerate(range(0, n, STRIDE)):
             torch.manual_seed(1000 * e + u)
             obs = {
@@ -51,9 +53,11 @@ def run(ckpt, meta, imgs, eps, prompt):
             tcp.append(d.mean(0))
             tcp_end.append(d[-1])
             grip.append(np.abs(pred[:, [6, 13]] - gt[:, [6, 13]]).mean(0))
+            if g_pos[:, 0, 2].min() < z_press + 0.005:  # this chunk contains the press
+                press.append(p_pos[:, 0, 2].min() - g_pos[:, 0, 2].min())
     del pol
     torch.cuda.empty_cache()
-    return np.array(joint), np.array(tcp), np.array(tcp_end), np.array(grip)
+    return np.array(joint), np.array(tcp), np.array(tcp_end), np.array(grip), np.array(press)
 
 
 def main():
@@ -68,7 +72,7 @@ def main():
     eps = np.linspace(0, len(meta["ep_len"]) - 1, a.episodes).astype(int)
     print(f"{len(eps)} episodes from {a.data}, prompt: {prompt!r}")
     for ck in a.ckpt:
-        joint, tcp, tcp_end, grip = run(ck, meta, imgs, eps, prompt)
+        joint, tcp, tcp_end, grip, press = run(ck, meta, imgs, eps, prompt)
         print(f"\n== {ck}  ({len(joint)} chunks)")
         print(f"  joint MAE (rad) left arm  {joint[:, :6].mean():.4f}   right arm {joint[:, 7:13].mean():.4f}")
         print(f"  right-arm joint MAE per joint {np.round(joint[:, 7:13].mean(0), 4)}")
@@ -76,6 +80,8 @@ def main():
               f"   at chunk end: left {100 * tcp_end[:, 0].mean():.2f}  right {100 * tcp_end[:, 1].mean():.2f}")
         print(f"  right TCP chunk-end error > 3 cm in {100 * (tcp_end[:, 1] > 0.03).mean():.0f}% of chunks")
         print(f"  gripper MAE left {grip[:, 0].mean():.3f}  right {grip[:, 1].mean():.3f}")
+        print(f"  press chunks: {len(press)}; predicted lowest left-TCP z minus recorded (mm): mean {1000 * press.mean():+.1f}"
+              f"  median {1000 * np.median(press):+.1f}; >= 3 mm too high in {100 * (press >= 0.003).mean():.0f}%")
 
 
 if __name__ == "__main__":
