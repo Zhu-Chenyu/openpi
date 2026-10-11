@@ -98,7 +98,10 @@ def lr_at(step: int, warmup: int, total: int, floor: float = 0.1) -> float:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", required=True)
-    ap.add_argument("--data", default="/data/users/dfv1344/mobilebench_data/put_back_block")
+    ap.add_argument(
+        "--data", default="/data/users/dfv1344/mobilebench_data/put_back_block",
+        help="prepped data dir, or several comma-separated (e.g. the original demos plus newly collected ones)",
+    )  # fmt: skip
     ap.add_argument("--weights", default="/data/users/dfv1344/openpi_data/pi05_base_pytorch/model.safetensors")
     ap.add_argument("--out", default="/data/users/dfv1344/mobilebench_checkpoints/put_back_block")
     ap.add_argument("--steps", type=int, default=8000)
@@ -149,24 +152,28 @@ def main():
 
     mb_cfg = mobilebench_config()
     tf, data_cfg = frame_transform(config_name=args.baseline_config)
-    meta = np.load(f"{args.data}/meta.npz")
+    data_dirs = args.data.split(",")
     if args.init_ckpt:  # the workspace library must be the one the init weights were trained with
         lib = rme.Library.load(f"{os.path.dirname(args.init_ckpt.rstrip('/'))}/library.npz")
     else:
-        lib = rme.Library.build(meta["state"])
+        lib = rme.Library.build(np.concatenate([np.load(f"{d}/meta.npz")["state"] for d in data_dirs]))
     lib.save(f"{out_dir}/library.npz")
     json.dump(dataclasses.asdict(mb_cfg), open(f"{out_dir}/mobilebench_config.json", "w"), indent=1)
     json.dump(vars(args), open(f"{out_dir}/train_args.json", "w"), indent=1)
     # Norm stats travel with the checkpoint so evaluation un-normalises exactly like training.
     shutil.copytree(_config.get_config(args.baseline_config).assets_dirs, f"{out_dir}/assets", dirs_exist_ok=True)
 
-    ds = rme.EpisodeSequences(args.data, tf, mb_cfg, lib, stride=args.stride, trace_lags=4)
+    parts = [rme.EpisodeSequences(d, tf, mb_cfg, lib, stride=args.stride, trace_lags=4) for d in data_dirs]
+    ds = parts[0] if len(parts) == 1 else torch.utils.data.ConcatDataset(parts)
+    ep_task = [t for p in parts for t in p.ep_task]
+    ep_len = np.concatenate([p.meta["ep_len"] for p in parts])
+    logging.info("data: %s", ", ".join(f"{d} ({len(p)} episodes)" for d, p in zip(data_dirs, parts)))
     sampler = None
     if args.task_shares:
         shares = {k: float(v) for k, v in (kv.split("=") for kv in args.task_shares.split(","))}
         # One draw = one whole episode, so per-episode task weights give frame shares (task_mix docstring).
-        w = task_mix.task_weights(ds.ep_task, meta["ep_len"], shares)
-        logging.info("task frame shares: %s", {k: round(v, 3) for k, v in task_mix.frame_shares(ds.ep_task, meta["ep_len"], w).items()})
+        w = task_mix.task_weights(ep_task, ep_len, shares)
+        logging.info("task frame shares: %s", {k: round(v, 3) for k, v in task_mix.frame_shares(ep_task, ep_len, w).items()})
         sampler = torch.utils.data.WeightedRandomSampler(torch.as_tensor(w), num_samples=len(ds), replacement=True)
     if args.window > 0:
         ep_loader = torch.utils.data.DataLoader(
