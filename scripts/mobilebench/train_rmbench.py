@@ -106,6 +106,10 @@ def main():
     ap.add_argument("--out", default="/data/users/dfv1344/mobilebench_checkpoints/put_back_block")
     ap.add_argument("--steps", type=int, default=8000)
     ap.add_argument("--episodes_per_batch", type=int, default=8)
+    ap.add_argument(
+        "--grad_accum", type=int, default=1,
+        help="micro-batches of --episodes_per_batch per optimizer step (same update, less GPU memory)",
+    )  # fmt: skip
     ap.add_argument("--stride", type=int, default=50)
     ap.add_argument("--lr_pretrained", type=float, default=2.5e-5)
     ap.add_argument("--lr_new", type=float, default=1e-4)
@@ -242,23 +246,24 @@ def main():
     t_last, wait_acc, frames_acc = time.time(), 0.0, 0
     total_steps = args.max_steps_debug or args.steps
     while step < total_steps:
-        t_wait = time.time()
-        batch = next(batches)
-        wait_acc += time.time() - t_wait
-        batch = to_device(batch, device)
-        obs = _model.Observation.from_dict(batch["observation"])
-        n = batch["actions"].shape[0]
-        frames_acc += n
-        frames_seen += n
-        batch["observation"] = obs
-        batch["action_mask"] = action_mask[None].expand(n, -1)
         scale = lr_at(step, args.warmup, args.steps)
         for g in optim.param_groups:
             g["lr"] = g["base_lr"] * scale
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss, logs, memory = model.episode_loss(batch, weights, memory if args.window > 0 else None)
         optim.zero_grad(set_to_none=True)
-        loss.backward()
+        for _ in range(args.grad_accum):
+            t_wait = time.time()
+            batch = next(batches)
+            wait_acc += time.time() - t_wait
+            batch = to_device(batch, device)
+            obs = _model.Observation.from_dict(batch["observation"])
+            n = batch["actions"].shape[0]
+            frames_acc += n
+            frames_seen += n
+            batch["observation"] = obs
+            batch["action_mask"] = action_mask[None].expand(n, -1)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, logs, memory = model.episode_loss(batch, weights, memory if args.window > 0 else None)
+            (loss / args.grad_accum).backward()
         # Clip per group: the new modules' auxiliary-loss gradients are large early on
         # and a single global norm would shrink the pretrained expert's FM update with them.
         gnorms = [torch.nn.utils.clip_grad_norm_(g["params"], 1.0) for g in groups]
