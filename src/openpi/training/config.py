@@ -731,6 +731,58 @@ _CONFIGS = [
         wandb_enabled=False,
         fsdp_devices=1,
     ),
+    # Continue the single-task pi0.5 LoRA run (putback_lora_v2_30k, step 29999 EMA params, 480k
+    # frames) on the original 250 put_back_block demos plus 250 newly collected demo_clean demos
+    # (`rmbench/put_back_block_clean500`, Memory-Augmented-VLA scripts/rmbench/make_lerobot_with_collected.py).
+    # Matched to the MobileBench run continued from mb_lora_v1/8000 on the same data: half the
+    # original peak LR, 200 warmup steps, ~172k more frames (10,750 x 16). Norm stats stay those of
+    # the original dataset (asset_id), so the continued model normalises like its checkpoint.
+    TrainConfig(
+        name="pi05_rmbench_put_back_block_clean_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="rmbench/put_back_block_clean500",
+            assets=AssetsConfig(asset_id="rmbench/put_back_block"),
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head",
+                                "cam_left_wrist": "observation.images.front",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/users/dfv1344/openpi_checkpoints/pi05_rmbench_put_back_block_lora/putback_lora_v2_30k/29999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=200, peak_lr=1.25e-5, decay_steps=10_750),
+        num_train_steps=10_750,
+        batch_size=16,
+        num_workers=8,
+        log_interval=50,
+        save_interval=5375,
+        keep_period=5375,
+        wandb_enabled=False,
+        fsdp_devices=1,
+    ),
     #
     # Inference Aloha configs.
     #
