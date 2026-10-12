@@ -20,6 +20,7 @@ client has it), so the conditioner sees the same dt / increment scale as in trai
 """
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -114,6 +115,9 @@ def main():
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", force=True)
     policy = MemoryPolicy(args.ckpt, args.weights)
+    # The client sits in a long SAPIEN rollout between calls and can miss keepalive pongs, which made
+    # the server drop the connection mid-eval ("keepalive ping timeout"). Localhost only: no keepalive.
+    websocket_policy_server._server.serve = functools.partial(websocket_policy_server._server.serve, ping_interval=None)
     server = websocket_policy_server.WebsocketPolicyServer(policy, host="127.0.0.1", port=args.port)
     logging.info("serving %s on port %d", args.ckpt, args.port)
     server.serve_forever()
