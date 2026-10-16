@@ -157,6 +157,12 @@ class EpisodeSequences(torch.utils.data.Dataset):
         self.events = {}
         for e, f, a, c in self.meta["events"]:
             self.events.setdefault(int(e), []).append((int(f), int(a), int(c)))
+        # Slow-memory phase sentences (annotate_phases.py); absent = no slow-text label.
+        self.phase_frame, self.phase_text, self.phase_texts = None, None, None
+        if os.path.exists(f"{data_dir}/phase_labels.npz"):
+            pl = np.load(f"{data_dir}/phase_labels.npz")
+            self.phase_frame, self.phase_text = pl["frame_phase"], pl["text_emb"]
+            self.phase_texts = [str(t) for t in pl["texts"]]
         self._img = None
 
     def __len__(self):
@@ -214,7 +220,12 @@ class EpisodeSequences(torch.utils.data.Dataset):
             "trace_avail": np.zeros((u, NUM_EE * self.lags), bool),
             "mode": np.ones(u, np.int64),  # MANIP
             "mode_present": np.ones(u, bool),
+            "phase_id": np.zeros(u, np.int64),
+            "phase_present": np.zeros(u, bool),
         }
+        if self.phase_frame is not None:
+            ph = self.phase_frame[s0 + frames]
+            lab["phase_id"], lab["phase_present"] = np.maximum(ph, 0), ph >= 0
         for k, t in enumerate(frames):
             nxt = [(f, a) for f, a, _ in ev if f > t]
             if nxt:

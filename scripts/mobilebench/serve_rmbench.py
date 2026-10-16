@@ -37,6 +37,7 @@ import train_rmbench  # noqa: E402
 from openpi.models import model as _model  # noqa: E402
 from openpi.models_pytorch.mobilebench.conditioner import StepInputs  # noqa: E402
 from openpi.models_pytorch.mobilebench.config import MobileBenchConfig  # noqa: E402
+from openpi.models_pytorch.mobilebench.v111 import V111Config  # noqa: E402
 from openpi_client import base_policy  # noqa: E402
 from openpi.serving import websocket_policy_server  # noqa: E402
 import openpi.transforms as _transforms  # noqa: E402
@@ -45,7 +46,13 @@ import openpi.transforms as _transforms  # noqa: E402
 class MemoryPolicy(base_policy.BasePolicy):
     def __init__(self, ckpt: str, weights: str, num_steps: int = 10, stride: int = 50, fps: float = 25.0):
         exp_dir = os.path.dirname(ckpt.rstrip("/"))
-        self.cfg = MobileBenchConfig(**json.load(open(f"{exp_dir}/mobilebench_config.json")))
+        self.v111 = os.path.exists(f"{exp_dir}/{train_rmbench.CONFIG_FILES['v1.11']}")
+        if self.v111:
+            self.cfg = V111Config(**json.load(open(f"{exp_dir}/{train_rmbench.CONFIG_FILES['v1.11']}")))
+            pt = np.load(f"{exp_dir}/phase_texts.npz")
+            self.phase_texts, self.phase_emb = [str(t) for t in pt["texts"]], torch.as_tensor(pt["text_emb"])
+        else:
+            self.cfg = MobileBenchConfig(**json.load(open(f"{exp_dir}/mobilebench_config.json")))
         self.lib = rme.Library.load(f"{exp_dir}/library.npz")
         self.dev = torch.device("cuda")
         targs = json.load(open(f"{exp_dir}/train_args.json"))
@@ -74,7 +81,8 @@ class MemoryPolicy(base_policy.BasePolicy):
     def infer(self, obs: dict) -> dict:
         state14 = np.asarray(obs["state"], np.float32)
         if obs.get("reset") or self.memory is None:
-            self.memory, self.prev, self.updates = self.model.conditioner.init_memory(1, self.dev), None, 0
+            init = self.model.init_memory if self.v111 else self.model.conditioner.init_memory
+            self.memory, self.prev, self.updates = init(1, self.dev), None, 0
         d = self.input_tf({"images": obs["images"], "state": state14, "prompt": obs["prompt"]})
         batch = {k: (v[None] if not isinstance(v, dict) else {kk: vv[None] for kk, vv in v.items()}) for k, v in d.items()}
         batch = train_rmbench.to_device(
@@ -89,7 +97,7 @@ class MemoryPolicy(base_policy.BasePolicy):
             prev = np.asarray(obs["prev_state"], np.float32)
         fields = rme.step_inputs(state14, prev, self.dt, self.lib, np.asarray(d["state"]), self.cfg)
         fields = {k: torch.as_tensor(np.asarray(v))[None].to(self.dev) for k, v in fields.items()}
-        step = StepInputs(h=None, h_mask=None, **fields)
+        step = fields if self.v111 else StepInputs(h=None, h_mask=None, **fields)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             act, _, out = self.model.infer(observation, step, self.memory, num_steps=self.num_steps)
         if commit:
@@ -97,6 +105,15 @@ class MemoryPolicy(base_policy.BasePolicy):
             self.updates += 1
         actions = act[0].float().cpu().numpy()
         res = self.output_tf({"state": np.asarray(d["state"]), "actions": actions})
+        if self.v111:
+            sim = out.phase_z[0].float().cpu() @ self.phase_emb.T
+            logging.info(
+                "update %d%s: slow_written=%s  aff obj=%s (valid %.2f)  slow readout: %r",
+                self.updates, "" if commit else " (re-plan, not committed)", bool(out.slow_written[0]),
+                np.round(out.aff_points[0, 1].float().cpu().numpy(), 3), out.aff_logits[0, 1].sigmoid().item(),
+                self.phase_texts[int(sim.argmax())],
+            )  # fmt: skip
+            return {"actions": np.asarray(res["actions"])}
         logging.info(
             "update %d%s: slow_written=%s  A_use obj=%s (valid %.2f)  goal L/R valid=%s",
             self.updates, "" if commit else " (re-plan, not committed)", bool(out.slow_written[0]),

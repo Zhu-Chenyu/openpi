@@ -35,6 +35,9 @@ from openpi.models_pytorch.mobilebench.config import MobileBenchConfig  # noqa: 
 from openpi.models_pytorch.mobilebench.model import LossWeights  # noqa: E402
 from openpi.models_pytorch.mobilebench.model import MobileBenchPi05  # noqa: E402
 from openpi.models_pytorch.mobilebench.model import trainable_parameter_groups  # noqa: E402
+from openpi.models_pytorch.mobilebench.v111 import LossWeightsV111  # noqa: E402
+from openpi.models_pytorch.mobilebench.v111 import MobileBenchV111  # noqa: E402
+from openpi.models_pytorch.mobilebench.v111 import V111Config  # noqa: E402
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch  # noqa: E402
 from openpi.training import config as _config  # noqa: E402
 from openpi.training import task_mix  # noqa: E402
@@ -44,7 +47,13 @@ import openpi.transforms as _transforms  # noqa: E402
 BASELINE_CONFIG = "pi05_rmbench_put_back_block_lora"
 
 
-def mobilebench_config() -> MobileBenchConfig:
+# Per-architecture config file in the run dir (serve_rmbench.py picks the model from it).
+CONFIG_FILES = {"v1.2": "mobilebench_config.json", "v1.11": "mobilebench_v111_config.json"}
+
+
+def mobilebench_config(arch: str = "v1.2"):
+    if arch == "v1.11":
+        return V111Config()
     return MobileBenchConfig(
         num_end_effectors=2,  # aloha left + right
         action_workspace_tokens=16,  # pool the 128 library tokens before the action heads
@@ -64,14 +73,15 @@ def frame_transform(assets_dirs=None, config_name: str = BASELINE_CONFIG):
     return _transforms.compose(tfs), data
 
 
-def build_model(weights: str, mb_cfg: MobileBenchConfig, device, *, vlm_lora=False, expert_lora=False) -> MobileBenchPi05:
+def build_model(weights: str, mb_cfg, device, *, vlm_lora=False, expert_lora=False):
     pcfg = pi0_config.Pi0Config(pi05=True, pytorch_compile_mode=None)
     pi0 = PI0Pytorch(pcfg)
     missing, unexpected = safetensors.torch.load_model(pi0, weights, strict=False)
     if missing or unexpected:
         logging.warning("pi05 weights: %d missing, %d unexpected (e.g. %s)", len(missing), len(unexpected),
                         (missing or unexpected)[:3])  # fmt: skip
-    model = MobileBenchPi05(pi0, mb_cfg, vlm_lora=vlm_lora, expert_lora=expert_lora)
+    cls = MobileBenchV111 if isinstance(mb_cfg, V111Config) else MobileBenchPi05
+    model = cls(pi0, mb_cfg, vlm_lora=vlm_lora, expert_lora=expert_lora)
     del pi0
     return model.to(device)
 
@@ -98,6 +108,11 @@ def lr_at(step: int, warmup: int, total: int, floor: float = 0.1) -> float:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", required=True)
+    ap.add_argument(
+        "--arch", choices=sorted(CONFIG_FILES), default="v1.2",
+        help="v1.2: conditioner after a frozen-input VLM; v1.11: memory tokens into the VLM, MLP writers, "
+        "slow-text supervision (needs phase_labels.npz from annotate_phases.py in every data dir)",
+    )  # fmt: skip
     ap.add_argument(
         "--data", default="/data/users/dfv1344/mobilebench_data/put_back_block",
         help="prepped data dir, or several comma-separated (e.g. the original demos plus newly collected ones)",
@@ -154,7 +169,7 @@ def main():
     out_dir = os.path.join(args.out, args.exp)
     os.makedirs(out_dir, exist_ok=True)
 
-    mb_cfg = mobilebench_config()
+    mb_cfg = mobilebench_config(args.arch)
     tf, data_cfg = frame_transform(config_name=args.baseline_config)
     data_dirs = args.data.split(",")
     if args.init_ckpt:  # the workspace library must be the one the init weights were trained with
@@ -162,7 +177,7 @@ def main():
     else:
         lib = rme.Library.build(np.concatenate([np.load(f"{d}/meta.npz")["state"] for d in data_dirs]))
     lib.save(f"{out_dir}/library.npz")
-    json.dump(dataclasses.asdict(mb_cfg), open(f"{out_dir}/mobilebench_config.json", "w"), indent=1)
+    json.dump(dataclasses.asdict(mb_cfg), open(f"{out_dir}/{CONFIG_FILES[args.arch]}", "w"), indent=1)
     json.dump(vars(args), open(f"{out_dir}/train_args.json", "w"), indent=1)
     # Norm stats travel with the checkpoint so evaluation un-normalises exactly like training.
     shutil.copytree(_config.get_config(args.baseline_config).assets_dirs, f"{out_dir}/assets", dirs_exist_ok=True)
@@ -172,6 +187,12 @@ def main():
     ep_task = [t for p in parts for t in p.ep_task]
     ep_len = np.concatenate([p.meta["ep_len"] for p in parts])
     logging.info("data: %s", ", ".join(f"{d} ({len(p)} episodes)" for d, p in zip(data_dirs, parts)))
+    phase_text = None
+    if args.arch == "v1.11":
+        if any(p.phase_texts is None for p in parts) or any(p.phase_texts != parts[0].phase_texts for p in parts):
+            raise RuntimeError("v1.11 needs the same phase_labels.npz text table in every data dir")
+        np.savez(f"{out_dir}/phase_texts.npz", texts=np.array(parts[0].phase_texts), text_emb=parts[0].phase_text)
+        phase_text = torch.as_tensor(parts[0].phase_text, device=device)
     sampler = None
     if args.task_shares:
         shares = {k: float(v) for k, v in (kv.split("=") for kv in args.task_shares.split(","))}
@@ -231,7 +252,7 @@ def main():
     train_params = [p for _, p in train_named]
     # fp32 shadow copy, updated after every optimizer step: w_ema = d * w_ema + (1 - d) * w.
     ema = [p.detach().clone().float() for p in train_params] if args.ema > 0 else None
-    weights = LossWeights()
+    weights = LossWeightsV111() if args.arch == "v1.11" else LossWeights()
     # RMBench put_back_block: 14 real action dims (left 6+1, right 6+1) of the padded 32.
     action_mask = torch.zeros(model.action_dim, dtype=torch.bool, device=device)
     action_mask[:14] = True
@@ -262,7 +283,11 @@ def main():
             batch["observation"] = obs
             batch["action_mask"] = action_mask[None].expand(n, -1)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, logs, memory = model.episode_loss(batch, weights, memory if args.window > 0 else None)
+                carry = memory if args.window > 0 else None
+                if args.arch == "v1.11":
+                    loss, logs, memory = model.episode_loss(batch, weights, phase_text, carry)
+                else:
+                    loss, logs, memory = model.episode_loss(batch, weights, carry)
             (loss / args.grad_accum).backward()
         # Clip per group: the new modules' auxiliary-loss gradients are large early on
         # and a single global norm would shrink the pretrained expert's FM update with them.
