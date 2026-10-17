@@ -37,7 +37,10 @@ def main():
     dev = torch.device(a.device)
     pi0 = PI0Pytorch(pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy",
                                           pytorch_compile_mode=None))  # fmt: skip
-    cfg = V111Config(vlm_width=pi0.paligemma_with_expert.paligemma.config.text_config.hidden_size)
+    width = pi0.paligemma_with_expert.paligemma.config.text_config.hidden_size
+    proj = pi0.paligemma_with_expert.paligemma.model.multi_modal_projector
+    proj.linear = torch.nn.Linear(proj.linear.in_features, width)  # the dummy LM is narrower than SigLIP's projector
+    cfg = V111Config(vlm_width=width)
     model = MobileBenchV111(pi0, cfg, vlm_lora=True, expert_lora=True).to(dev)
     model.train()
 
