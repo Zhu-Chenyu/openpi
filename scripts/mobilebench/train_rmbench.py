@@ -200,6 +200,7 @@ def main():
 
     if nav:
         parts = [nav_episodes.NavEpisodeSequences(d, tf, mb_cfg, stride=args.stride) for d in data_dirs]
+        np.save(f"{out_dir}/nav_base_desc.npy", parts[0].desc)  # the eval server's e_b input
     else:
         parts = [rme.EpisodeSequences(d, tf, mb_cfg, lib, stride=args.stride, trace_lags=4) for d in data_dirs]
     ds = parts[0] if len(parts) == 1 else torch.utils.data.ConcatDataset(parts)
