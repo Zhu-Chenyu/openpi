@@ -314,7 +314,7 @@ def collate(items: list[dict]) -> dict:
         "tokenized_prompt": stack_obs(("tokenized_prompt",)),
         "tokenized_prompt_mask": stack_obs(("tokenized_prompt_mask",)),
     }
-    return {
+    out = {
         "observation": observation,
         "actions": stack_obs(("actions",)),
         "slot": torch.tensor(slot),
@@ -325,6 +325,9 @@ def collate(items: list[dict]) -> dict:
         "episodes": [it["episode"] for it in items],
         "tasks": [it.get("task") for it in items],
     }
+    if "base_actions" in items[0]:  # base-head chunks (nav_episodes.py), same flat order as "actions"
+        out["base_actions"] = torch.from_numpy(np.concatenate([it["base_actions"] for it in items]))
+    return out
 
 
 def first(items: list):
@@ -340,6 +343,7 @@ def slice_item(item: dict, a: int, b: int) -> dict:
         "labels": {k: v[a:b] for k, v in item["labels"].items()},
         "episode": item["episode"],
         "task": item["task"],
+        **({"base_actions": item["base_actions"][a:b]} if "base_actions" in item else {}),
     }
 
 

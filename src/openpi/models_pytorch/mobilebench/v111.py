@@ -324,21 +324,28 @@ class MobileBenchV111(nn.Module):
 
     # -- inference -------------------------------------------------------------------------------------
     @torch.no_grad()
-    def infer(self, observation, st: dict, memory: MemoryV111, *, num_steps: int = 10):
-        """One new observation: read the old memory in the VLM, write it once, then denoise with fixed Z_t."""
+    def infer(self, observation, st: dict, memory: MemoryV111, *, num_steps: int = 10, base_dim_mask=None):
+        """One new observation: read the old memory in the VLM, write it once, then denoise with fixed Z_t.
+
+        base_dim_mask [n, action_dim]: the base head's valid dims (None = fixed base, no base chunk)."""
         memory = self.reset_memory(memory, st["new_episode"])
         emb, pad = self.embed_observation(observation, train=False)
         slots = torch.arange(emb.shape[0], device=emb.device)
         out = self.update(emb, pad, st, memory, slots)
-        act_u, act_b = self.sample_actions(out.kv, out.head_pad, out.cond, out.cond_mask, num_steps=num_steps)
+        act_u, act_b = self.sample_actions(
+            out.kv, out.head_pad, out.cond, out.cond_mask, base_dim_mask=base_dim_mask, num_steps=num_steps
+        )
         return act_u, act_b, out
 
     # -- episode-sequence training -----------------------------------------------------------------------
-    def episode_loss(self, batch: dict, weights: "LossWeightsV111", phase_text: Tensor, memory: MemoryV111 | None = None):
+    def episode_loss(self, batch: dict, weights: "LossWeightsV111", phase_text: Tensor, memory: MemoryV111 | None = None,
+                     phase_group: tuple[str, Tensor] | None = None):  # fmt: skip
         """Same batch layout as MobileBenchPi05.episode_loss (scripts/mobilebench/rmbench_episodes.py).
 
         phase_text [T, phase_text_dim]: the frozen, normalised text embeddings that labels["phase_id"]
-        indexes. Returns (loss, logs, memory after the window, DETACHED).
+        indexes. phase_group (name, [T] group id of every sentence) adds a slow_<name>_acc log (default:
+        put_back_block's 7 phases x 4 mats, "mat" = id % 4). Returns (loss, logs, memory after the window,
+        DETACHED).
         """
         active = batch["active"]
         b, u = active.shape
@@ -388,8 +395,11 @@ class MobileBenchV111(nn.Module):
             m = pick("aff_present")[:, OBJ] & pick("aff_use_valid")[:, OBJ]
             aff_err = ((pts[:, OBJ] - pick("aff_point")[:, OBJ]).norm(dim=-1) * m).sum() / m.sum().clamp_min(1)
             ph_acc = ((ph_logits.argmax(-1) == pick("phase_id")) & ph_mask).sum() / ph_mask.sum().clamp_min(1)
-            mats = phase_text.shape[0] // 7  # 7 phases x mats (annotate_phases.py)
-            mat_acc = ((ph_logits.argmax(-1) % mats == pick("phase_id") % mats) & ph_mask).sum() / ph_mask.sum().clamp_min(1)
+            if phase_group is None:  # put_back_block: 7 phases x 4 mats (annotate_phases.py)
+                ids = torch.arange(phase_text.shape[0], device=phase_text.device)
+                phase_group = ("mat", ids % (phase_text.shape[0] // 7))
+            g_name, g = phase_group
+            g_acc = ((g[ph_logits.argmax(-1)] == g[pick("phase_id")]) & ph_mask).sum() / ph_mask.sum().clamp_min(1)
         logs = {
             "loss": total.item(),
             "fm_upper": fm_u.item(),
@@ -399,7 +409,7 @@ class MobileBenchV111(nn.Module):
             "slow_text": slow_text.item(),
             "aff_obj_err_m": aff_err.item(),
             "slow_text_acc": ph_acc.item(),
-            "slow_mat_acc": mat_acc.item(),
+            f"slow_{g_name}_acc": g_acc.item(),
             "updates_per_slot": active.sum().item() / b,
         }
         return total, logs, mem.detach()
