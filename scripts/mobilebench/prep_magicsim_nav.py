@@ -84,7 +84,9 @@ def main():
     os.makedirs(out, exist_ok=True)
     eps = json.load(open(sources))["episodes"]
     cols = {k: [] for k in ("state", "action", "pos", "yaw", "nav_point", "obj_point", "obj_visible", "height")}
-    texts, lens, imgs = [], [], []
+    texts, lens = [], []
+    tmp = f"{out}/images_tmp"  # per-episode frames, joined at the end (all of them do not fit in RAM)
+    os.makedirs(tmp, exist_ok=True)
     for e in eps:
         d = f"{raw}/{e['run']}/navto/000/magicsim/{e['run_episode']}"
         ep = nav_labels.load(d, "fridge")
@@ -94,7 +96,7 @@ def main():
         n = len(ep["pos"])
         if len(frames) < n:  # hold the last frame if the video is a frame short
             frames = np.concatenate([frames, np.repeat(frames[-1:], n - len(frames), 0)])
-        imgs.append(frames[:n])
+        np.save(f"{tmp}/{len(lens)}.npy", frames[:n])
         goal = ep["nav_goal"].copy()
         cols["state"].append(vel)
         cols["action"].append(ep["base_cmd"].astype(np.float32))
@@ -125,12 +127,15 @@ def main():
         f"{out}/meta.npz", **meta, ep_index=np.arange(len(eps)), ep_start=np.concatenate([[0], np.cumsum(lens)[:-1]]),
         ep_len=lens, fps=FPS, prompt="Navigate to the fridge.", base_height=np.float32(h[0]),
     )  # fmt: skip
-    img = np.lib.format.open_memmap(f"{out}/images_onboard.npy", "w+", np.uint8, (int(lens.sum()), *imgs[0].shape[1:]))
+    shape = np.load(f"{tmp}/0.npy", mmap_mode="r").shape[1:]
+    img = np.lib.format.open_memmap(f"{out}/images_onboard.npy", "w+", np.uint8, (int(lens.sum()), *shape))
     s = 0
-    for x in imgs:
-        img[s : s + len(x)] = x
-        s += len(x)
+    for i in range(len(lens)):
+        img[s : s + lens[i]] = np.load(f"{tmp}/{i}.npy")
+        s += lens[i]
+        os.remove(f"{tmp}/{i}.npy")
     img.flush()
+    os.rmdir(tmp)
 
     table = sorted(set(texts))
     # Group = the detour side a sentence states (0 none, 1 left, 2 right): logged as slow_side_acc.
