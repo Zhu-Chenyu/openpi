@@ -27,6 +27,7 @@ import safetensors.torch
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mm_episodes  # noqa: E402
 import nav_episodes  # noqa: E402
 import rmbench_episodes as rme  # noqa: E402
 
@@ -110,9 +111,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", required=True)
     ap.add_argument(
-        "--dataset", choices=("rmbench", "magicsim_nav"), default="rmbench",
+        "--dataset", choices=("rmbench", "magicsim_nav", "magicsim_mm"), default="rmbench",
         help="rmbench: aloha arms, prep_rmbench*.py data, --baseline_config transforms; magicsim_nav: go2 base "
-        "commands to the base head, prep_magicsim_nav.py data with its own norm stats (v1.11 only)",
+        "commands to the base head, prep_magicsim_nav.py data with its own norm stats (v1.11 only); magicsim_mm: "
+        "Go2Plus EEF + gripper to the upper head and base commands to the base head, prep_magicsim_mm.py data",
     )  # fmt: skip
     ap.add_argument(
         "--arch", choices=sorted(CONFIG_FILES), default="v1.2",
@@ -178,14 +180,20 @@ def main():
     mb_cfg = mobilebench_config(args.arch)
     data_dirs = args.data.split(",")
     nav = args.dataset == "magicsim_nav"
-    if nav and (args.arch != "v1.11" or len(data_dirs) != 1):
-        raise ValueError("--dataset magicsim_nav needs --arch v1.11 and one data dir (its norm stats)")
+    mm = args.dataset == "magicsim_mm"
+    if (nav or mm) and (args.arch != "v1.11" or len(data_dirs) != 1):
+        raise ValueError(f"--dataset {args.dataset} needs --arch v1.11 and one data dir (its norm stats)")
     if nav:
         tf, _ = nav_episodes.frame_transform(f"{data_dirs[0]}/assets")
+    elif mm:
+        tf, _ = mm_episodes.frame_transform(f"{data_dirs[0]}/assets")
     else:
         tf, data_cfg = frame_transform(config_name=args.baseline_config)
     if nav:
         lib = None
+    elif mm:
+        lib = (mm_episodes.Library.load(f"{os.path.dirname(args.init_ckpt.rstrip('/'))}/library.npz") if args.init_ckpt
+               else mm_episodes.Library.build(np.load(f"{data_dirs[0]}/meta.npz")["state"]))  # fmt: skip
     elif args.init_ckpt:  # the workspace library must be the one the init weights were trained with
         lib = rme.Library.load(f"{os.path.dirname(args.init_ckpt.rstrip('/'))}/library.npz")
     else:
@@ -195,12 +203,15 @@ def main():
     json.dump(dataclasses.asdict(mb_cfg), open(f"{out_dir}/{CONFIG_FILES[args.arch]}", "w"), indent=1)
     json.dump(vars(args), open(f"{out_dir}/train_args.json", "w"), indent=1)
     # Norm stats travel with the checkpoint so evaluation un-normalises exactly like training.
-    assets = f"{data_dirs[0]}/assets" if nav else _config.get_config(args.baseline_config).assets_dirs
+    assets = f"{data_dirs[0]}/assets" if nav or mm else _config.get_config(args.baseline_config).assets_dirs
     shutil.copytree(assets, f"{out_dir}/assets", dirs_exist_ok=True)
 
     if nav:
         parts = [nav_episodes.NavEpisodeSequences(d, tf, mb_cfg, stride=args.stride) for d in data_dirs]
         np.save(f"{out_dir}/nav_base_desc.npy", parts[0].desc)  # the eval server's e_b input
+    elif mm:
+        parts = [mm_episodes.MMEpisodeSequences(d, tf, mb_cfg, lib, stride=args.stride) for d in data_dirs]
+        np.save(f"{out_dir}/mm_base_desc.npy", parts[0].desc)
     else:
         parts = [rme.EpisodeSequences(d, tf, mb_cfg, lib, stride=args.stride, trace_lags=4) for d in data_dirs]
     ds = parts[0] if len(parts) == 1 else torch.utils.data.ConcatDataset(parts)
@@ -213,7 +224,9 @@ def main():
             raise RuntimeError("v1.11 needs the same phase_labels.npz text table in every data dir")
         np.savez(f"{out_dir}/phase_texts.npz", texts=np.array(parts[0].phase_texts), text_emb=parts[0].phase_text)
         phase_text = torch.as_tensor(parts[0].phase_text, device=device)
-    phase_group = ("side", torch.as_tensor(parts[0].phase_group, device=device)) if nav else None
+    phase_group = None
+    if nav or mm:
+        phase_group = ("side" if nav else "holding", torch.as_tensor(parts[0].phase_group, device=device))
     sampler = None
     if args.task_shares:
         shares = {k: float(v) for k, v in (kv.split("=") for kv in args.task_shares.split(","))}
@@ -276,10 +289,14 @@ def main():
     weights = LossWeightsV111() if args.arch == "v1.11" else LossWeights()
     # RMBench put_back_block: 14 real action dims (left 6+1, right 6+1) of the padded 32 for the upper head.
     # MagicSim nav: no arm; the base head predicts (vx, vy, yaw rate) in its first 3 dims.
+    # MagicSim Go2Plus: upper head EEF pose + gripper (10 dims), base head (vx, vy, yaw rate, height).
     action_mask = torch.zeros(model.action_dim, dtype=torch.bool, device=device)
     base_mask = torch.zeros(model.action_dim, dtype=torch.bool, device=device)
     if nav:
         base_mask[: nav_episodes.BASE_DIMS] = True
+    elif mm:
+        action_mask[: mm_episodes.UPPER_DIMS] = True
+        base_mask[: mm_episodes.BASE_DIMS] = True
     else:
         action_mask[:14] = True
 
