@@ -105,7 +105,7 @@ def embed(sentences: list[str]) -> np.ndarray:
     tok = CLIPTokenizer.from_pretrained(TEXT_MODEL)
     model = CLIPTextModelWithProjection.from_pretrained(TEXT_MODEL).eval()
     with torch.no_grad():
-        e = model(**tok(sentences, padding=True, return_tensors="pt")).text_embeds
+        e = model(**tok(sentences, padding=True, truncation=True, max_length=77, return_tensors="pt")).text_embeds
     return torch.nn.functional.normalize(e, dim=-1).numpy().astype(np.float32)
 
 

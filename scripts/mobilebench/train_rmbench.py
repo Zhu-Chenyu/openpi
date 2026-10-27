@@ -227,6 +227,8 @@ def main():
     phase_group = None
     if nav or mm:
         phase_group = ("side" if nav else "holding", torch.as_tensor(parts[0].phase_group, device=device))
+    elif getattr(parts[0], "phase_group", None) is not None:  # RMBench tasks with a group table (annotate_rmbench_subtasks.py)
+        phase_group = (parts[0].phase_group[0], torch.as_tensor(parts[0].phase_group[1], device=device))
     sampler = None
     if args.task_shares:
         shares = {k: float(v) for k, v in (kv.split("=") for kv in args.task_shares.split(","))}

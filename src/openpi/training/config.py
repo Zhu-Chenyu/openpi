@@ -560,8 +560,61 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+# RMBench tasks other than put_back_block, each trained on its own: the task's original GR00T demos + 250 collected
+# clean demos (LeRobot view `rmbench/<task>_clean`, openpi scripts/mobilebench/make_lerobot_rmbench_task.py), from
+# pi05_base with the put_back_block LoRA recipe (batch 16, 30k steps, default cosine schedule). Norm stats are
+# computed on that dataset (scripts/compute_norm_stats.py); the MobileBench runs of the same task read them too.
+RMBENCH_TASKS = (
+    "battery_try",
+    "blocks_ranking_try",
+    "cover_blocks",
+    "observe_and_pickup",
+    "place_block_mat",
+    "press_button",
+    "rearrange_blocks",
+    "swap_T",
+    "swap_blocks",
+)
+
+
+def _rmbench_task_lora(task: str) -> TrainConfig:
+    lora = pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora")
+    return TrainConfig(
+        name=f"pi05_rmbench_{task}_lora",
+        model=lora,
+        data=LeRobotAlohaDataConfig(
+            repo_id=f"rmbench/{task}_clean",
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {"cam_high": "observation.images.head", "cam_left_wrist": "observation.images.front"},
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        freeze_filter=lora.get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=16,
+        num_workers=8,
+        log_interval=50,
+        save_interval=5000,
+        keep_period=5000,
+        wandb_enabled=False,
+        fsdp_devices=1,
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    *[_rmbench_task_lora(t) for t in RMBENCH_TASKS],
     ###
     ### RMBench: single fixed-manipulation task (put_back_block), pi05 LoRA
     ###

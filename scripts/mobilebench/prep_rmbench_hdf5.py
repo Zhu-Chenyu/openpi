@@ -7,10 +7,12 @@ conversions store action[t] == state[t], so chunks are state[t : t+50]), cameras
 front at the collection resolution (LargeView, 240x320), fps 25.
 
 Outputs in <out>: images_head.npy, images_front.npy (uint8 memmaps) and meta.npz with the
-single-task keys of prep_rmbench.py (prompt instead of prompts / ep_prompt / ep_task).
+single-task keys of prep_rmbench.py (prompt instead of prompts / ep_prompt / ep_task, plus task).
+With --jpeg the collector's JPEG frames are copied as they are (jpeg_<cam>.bin + jpeg_<cam>_off.npy,
+see rmbench_episodes.EpisodeSequences) instead of decoded into memmaps: ~15x smaller.
 
 Usage: python prep_rmbench_hdf5.py <out_dir> <collect_dir> [<collect_dir> ...] \
-           [--prompt "..."] [--procs 16]
+           [--prompt "..."] [--task put_back_block] [--jpeg] [--procs 16]
        (collect_dir = <save_path>/<task>/<task_config>, containing data/episode*.hdf5)
 """
 
@@ -52,12 +54,19 @@ def _load(path):
     return vec, imgs
 
 
+def _load_jpeg(path):
+    with h5py.File(path, "r") as f:
+        return f["joint_action/vector"][:].astype(np.float32), {c: [bytes(b) for b in f[k][:]] for c, k in CAMS.items()}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("collect_dirs", nargs="+")
     ap.add_argument("--prompt", default=PUT_BACK_PROMPT)
     ap.add_argument("--procs", type=int, default=16)
+    ap.add_argument("--task", default="put_back_block")
+    ap.add_argument("--jpeg", action="store_true", help="keep the collector's JPEG frames instead of memmaps")
     args = ap.parse_args()
     files = [p for d in args.collect_dirs for p in _ep_files(d)]
     with mp.Pool(args.procs) as pool:
@@ -67,21 +76,36 @@ def main():
     with h5py.File(files[0], "r") as f:
         h, w = cv2.imdecode(np.frombuffer(f[CAMS["head"]][0], np.uint8), cv2.IMREAD_COLOR).shape[:2]
     os.makedirs(args.out, exist_ok=True)
-    mm = {c: np.lib.format.open_memmap(f"{args.out}/images_{c}.npy", "w+", np.uint8, (total, h, w, 3)) for c in CAMS}
+    if args.jpeg:
+        bins = {c: open(f"{args.out}/jpeg_{c}.bin", "wb") for c in CAMS}
+        offs = {c: [0] for c in CAMS}
+    else:
+        mm = {c: np.lib.format.open_memmap(f"{args.out}/images_{c}.npy", "w+", np.uint8, (total, h, w, 3)) for c in CAMS}
     state = np.zeros((total, 14), np.float32)
     events = []
     with mp.Pool(args.procs) as pool:
-        for i, (vec, imgs) in enumerate(pool.imap(_load, files, chunksize=2)):
+        for i, (vec, imgs) in enumerate(pool.imap(_load_jpeg if args.jpeg else _load, files, chunksize=2)):
             s, n = starts[i], lengths[i]
             state[s : s + n] = vec
             for c, im in imgs.items():
-                assert im.shape == (n, h, w, 3), (files[i], c, im.shape)
-                mm[c][s : s + n] = im
+                assert len(im) == n, (files[i], c, len(im))
+                if args.jpeg:
+                    for b in im:
+                        bins[c].write(b)
+                        offs[c].append(offs[c][-1] + len(b))
+                else:
+                    assert im.shape == (n, h, w, 3), (files[i], c, im.shape)
+                    mm[c][s : s + n] = im
             events += [(i, *e) for e in gripper_events(vec)]
             if i % 50 == 0:
                 print(f"{i + 1}/{len(files)} episodes", flush=True)
-    for v in mm.values():
-        v.flush()
+    if args.jpeg:
+        for c in CAMS:
+            bins[c].close()
+            np.save(f"{args.out}/jpeg_{c}_off.npy", np.array(offs[c], np.int64))
+    else:
+        for v in mm.values():
+            v.flush()
     tcp_pos, tcp_rot = aloha_fk.both_tcp(state)
     np.savez(
         f"{args.out}/meta.npz",
@@ -94,6 +118,7 @@ def main():
         tcp_rot=tcp_rot.astype(np.float32),
         events=np.array(sorted(events), dtype=np.int64),
         prompt=np.array(args.prompt),
+        task=np.array(args.task),
         fps=np.array(25),
         source_files=np.array(files),
     )

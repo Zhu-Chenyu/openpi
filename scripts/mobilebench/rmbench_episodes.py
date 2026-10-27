@@ -148,28 +148,44 @@ class EpisodeSequences(torch.utils.data.Dataset):
             self.prompts = [str(p) for p in self.meta["prompts"]]
             self.ep_prompt = self.meta["ep_prompt"]
             self.ep_task = [str(t) for t in self.meta["ep_task"]]
-        else:  # single-task put_back_block prep
+        else:  # single-task prep (put_back_block unless it names its task)
             self.prompts = [str(self.meta["prompt"])]
             self.ep_prompt = np.zeros(n_eps, int)
-            self.ep_task = ["put_back_block"] * n_eps
+            self.ep_task = [str(self.meta.get("task", "put_back_block"))] * n_eps
         self.video_root = str(self.meta.get("video_root", ""))
         self.dt = stride / float(self.meta["fps"])
         self.events = {}
         for e, f, a, c in self.meta["events"]:
             self.events.setdefault(int(e), []).append((int(f), int(a), int(c)))
         # Slow-memory phase sentences (annotate_phases.py); absent = no slow-text label.
-        self.phase_frame, self.phase_text, self.phase_texts = None, None, None
+        self.phase_frame, self.phase_text, self.phase_texts, self.phase_group = None, None, None, None
         if os.path.exists(f"{data_dir}/phase_labels.npz"):
             pl = np.load(f"{data_dir}/phase_labels.npz")
             self.phase_frame, self.phase_text = pl["frame_phase"], pl["text_emb"]
             self.phase_texts = [str(t) for t in pl["texts"]]
+            if "group" in pl:  # (name, group id per sentence) for a slow_<name>_acc log
+                self.phase_group = (str(pl["group_name"]), pl["group"])
+        # JPEG frames (prep --jpeg): jpeg_<cam>.bin holds the encoded frames back to back, jpeg_<cam>_off.npy
+        # their [total + 1] byte offsets; decoded on access like the collector's own hdf5 frames.
+        self.jpeg = os.path.exists(f"{data_dir}/jpeg_{cams[0]}_off.npy")
         self._img = None
 
     def __len__(self):
         return len(self.meta["ep_index"])
 
     def _frames(self, ep: int, s0: int, n: int, frames: np.ndarray) -> dict:
-        """{cam: uint8 [len(frames), H, W, 3]} from the memmaps, or decoded from the episode mp4s."""
+        """{cam: uint8 [len(frames), H, W, 3]} from the memmaps or JPEG frames, or decoded from the episode mp4s."""
+        if self.jpeg:
+            import cv2
+
+            if self._img is None:
+                self._img = {c: (np.memmap(f"{self.dir}/jpeg_{c}.bin", np.uint8, "r"), np.load(f"{self.dir}/jpeg_{c}_off.npy"))
+                             for c in self.cams}  # fmt: skip
+            out = {}
+            for c, (buf, off) in self._img.items():
+                out[c] = np.stack([cv2.imdecode(np.asarray(buf[off[s0 + t] : off[s0 + t + 1]]), cv2.IMREAD_COLOR)
+                                   for t in frames])  # fmt: skip
+            return out
         if not self.video_root:
             if self._img is None:  # opened lazily so every DataLoader worker has its own handles
                 self._img = {c: np.load(f"{self.dir}/images_{c}.npy", mmap_mode="r") for c in self.cams}
